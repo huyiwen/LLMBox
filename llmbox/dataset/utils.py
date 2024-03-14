@@ -82,6 +82,7 @@ def get_raw_dataset_loader(
             if dataset_name in infos:
 
                 logger.debug(f"Loading from a cloned repository: {dataset_path}, {dataset_name}")
+
                 def load_fn(split):
                     return datasets.load_dataset(
                         dataset_path,
@@ -94,10 +95,24 @@ def get_raw_dataset_loader(
             elif subset_name in infos:
 
                 logger.debug(f"Loading from a cloned repository: {dataset_path}, {subset_name}")
+
                 def load_fn(split):
                     return datasets.load_dataset(
                         dataset_path,
                         subset_name,
+                        split=split,
+                        trust_remote_code=True,
+                        download_config=download_config,
+                    )
+
+            elif "default" in infos:
+
+                logger.debug(f"Loading from a cloned repository: {dataset_path}, default")
+
+                def load_fn(split):
+                    return datasets.load_dataset(
+                        dataset_path,
+                        "default",
                         split=split,
                         trust_remote_code=True,
                         download_config=download_config,
@@ -112,6 +127,7 @@ def get_raw_dataset_loader(
         elif os.path.exists(os.path.join(dataset_path, "dataset_dict.json")):
 
             logger.debug(f"Loading from a local directory: {dataset_path}")
+
             def load_fn(split):
                 return datasets.load_from_disk(dataset_path)[split]
 
@@ -120,6 +136,7 @@ def get_raw_dataset_loader(
 
             new_dataset_path = os.path.join(dataset_path, subset_name)
             logger.debug(f"Loading from a local directory with subset: {new_dataset_path}")
+
             def load_fn(split):
                 return datasets.load_from_disk(new_dataset_path)[split]
 
@@ -127,6 +144,7 @@ def get_raw_dataset_loader(
         elif os.path.isdir(dataset_path):
 
             logger.debug(f"Loading from a manually-downloaded dataset: {dataset_name}, {subset_name}")
+
             def load_fn(split):
                 return datasets.load_dataset(
                     dataset_name,
@@ -145,6 +163,7 @@ def get_raw_dataset_loader(
             r_split = re.compile(r"{split}")
 
             logger.debug(f"Loading from a file: {dataset_path}")
+
             def load_fn(split):
                 dataset_file_path = r_subset.sub(subset_name, dataset_path)
                 if split:

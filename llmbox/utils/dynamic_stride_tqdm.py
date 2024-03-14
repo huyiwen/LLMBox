@@ -1,6 +1,9 @@
+from logging import getLogger
 from typing import Iterable, Optional, Union
 
 import tqdm
+
+logger = getLogger(__name__)
 
 
 class dynamic_stride_tqdm(tqdm.tqdm):
@@ -66,7 +69,7 @@ class dynamic_stride_tqdm(tqdm.tqdm):
                     n += 1 * self.stride_scale * len(obj)
                 else:
                     # Update the progress bar with dynamic strides
-                    n += 1 * self.stride_scale  * len(obj) / self.strides[int(n)]
+                    n += 1 * self.stride_scale * len(obj) / self.strides[int(n)]
                 if self.disallow_overflow:
                     n = min(n, len(self.strides))
 
@@ -80,6 +83,9 @@ class dynamic_stride_tqdm(tqdm.tqdm):
         finally:
             self.n = int(n)
             self.close()
+            logger.info(
+                f"{self.desc} finished at {self.n}{self.unit} after {self.format_interval(self.last_print_t - self.start_t)}."
+            )
 
     def hold_tqdm(self):
         """Hold the progress bar for one iteration."""

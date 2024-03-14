@@ -54,15 +54,15 @@ class ModelArguments:
         help="The device map for model and data",
     )
     vllm: bool = HfArg(
-        default=True,
+        default=None,
         help="Whether to use vllm",
     )
     flash_attention: bool = HfArg(
-        default=True,
+        default=None,
         help="Whether to use flash attention",
     )
     prefix_caching: bool = HfArg(
-        default=True,
+        default=None,
         help="Whether to cache prefix in get_ppl mode",
     )
     openai_api_key: str = HfArg(
@@ -189,8 +189,13 @@ class ModelArguments:
         if self.tokenizer_name_or_path is None:
             self.tokenizer_name_or_path = self.model_name_or_path
 
-        if self.is_openai_model() or self.is_anthropic_model():
-            self.vllm = False
+        if self.is_huggingface_model():
+            if self.vllm is None:
+                self.vllm = True
+            if self.flash_attention is None:
+                self.flash_attention = True
+            if self.prefix_caching is None:
+                self.prefix_caching = True
 
 
 @dataclass
@@ -359,6 +364,14 @@ def check_args(model_args: ModelArguments, dataset_args: DatasetArguments, evalu
     if dataset_args.dataset_name == "vicuna_bench" and model_args.openai_api_key is None:
         raise ValueError(
             "OpenAI API key is required for GPTEval metrics. Please set it by passing a `--openai_api_key` or through environment variable `OPENAI_API_KEY`."
+        )
+
+    # vllm has its own prefix caching mechanism
+    if model_args.prefix_caching and not model_args.vllm and "expandable_segments" not in os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF", ""
+    ):
+        logger.warning(
+            f"Prefix caching might results in cuda memory fragmentation, which can be mitigated by setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. See https://pytorch.org/docs/stable/notes/cuda.html#environment-variables for details."
         )
 
     args_ignored = set()

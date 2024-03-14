@@ -44,14 +44,16 @@ class vllmModel(Model):
 
         logger.info(f"Trying to load {args.model_name_or_path} using vllm...")
         self.type = args.model_type
+
         llm_kwargs = {}
         if hasattr(EngineArgs, "enable_prefix_caching"):
-            llm_kwargs["enable_prefix_caching"] = True
-        if hasattr(EngineArgs, "max_logprobs"):
-            llm_kwargs["max_logprobs"] = 20
-        llm_kwargs = {}
-        if hasattr(EngineArgs, "enable_prefix_caching"):
+            # this is an experimental feature of vllm, view details at https://github.com/vllm-project/vllm/blob/657061fdced8a33a60c1b09f5da2525de9da8f03/vllm/engine/arg_utils.py#L28
             llm_kwargs["enable_prefix_caching"] = args.prefix_caching
+        args.prefix_caching = None  # avoid using batch sampler, which is designed for huggingface models
+        if hasattr(EngineArgs, "max_logprobs"):
+            # compatible with vllm's main branch, which is not released yet
+            llm_kwargs["max_logprobs"] = 16
+
         self.model = LLM(
             model=args.model_name_or_path,
             tokenizer=args.tokenizer_name_or_path,
@@ -151,7 +153,12 @@ class vllmModel(Model):
                 cur_candidate_ids = self.word_labels[:option_num] + self.token_labels[:option_num]
             else:
                 cur_candidate_ids = self.candidate_ids
-            prob = torch.tensor([result.outputs[0].logprobs[0][idx] for idx in cur_candidate_ids])
+            if isinstance(result.outputs[0].logprobs[0][cur_candidate_ids[0]], float):
+                prob = torch.tensor([result.outputs[0].logprobs[0][idx] for idx in cur_candidate_ids])
+            else:
+                # Logprob: https://github.com/vllm-project/vllm/blob/2f8844ba08d77af8a64784317055b03a475f6051/vllm/sequence.py#L17
+                prob = torch.tensor([result.outputs[0].logprobs[0][idx].logprob for idx in cur_candidate_ids])
+
             prob = torch.softmax(prob, dim=0).tolist()
             answers.append(prob)
         return answers

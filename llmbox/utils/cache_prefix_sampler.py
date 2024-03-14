@@ -1,7 +1,7 @@
 from collections import OrderedDict, defaultdict
 from logging import getLogger
 from pprint import pformat
-from typing import Iterator, List, Optional, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 from cyac import Trie
@@ -23,8 +23,30 @@ class SequenceCache(DynamicCache):
         self.value_cache: List[torch.Tensor] = []
 
         self.seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
-        self.last_logits: List[torch.Tensor] = []
+        self.last_logits: List[torch.Tensor] = []  # used in `get_ppl` to concatenate logits
+        self.last_tokens: List[str] = []  # used in `get_cache` to concatenate tokens
         self.real_seq_length: List[int] = []
+
+    def set_last_tokens(self, last_tokens: Union[str, List[str]]):
+        if isinstance(last_tokens, str):
+            last_tokens = [last_tokens]
+
+        if len(last_tokens) != self.get_seq_num():
+            raise ValueError(
+                f"last_tokens ({len(last_tokens)}) should be a list of strings with the same length as the cache ({self.get_seq_num()})"
+            )
+
+        self.last_tokens = last_tokens
+
+    def set_last_logits(self, last_logits: Union[torch.Tensor, List[torch.Tensor]]):
+        if isinstance(last_logits, torch.Tensor):
+            last_logits = [last_logits]
+
+        if len(last_logits) != self.get_seq_num():
+            raise ValueError(
+                f"last_logits ({len(last_logits)}) should be a list of tensors with the same length as the cache ({self.get_seq_num()})"
+            )
+        self.last_logits = last_logits
 
     @classmethod
     def from_legacy_cache(cls, past_key_values: Optional[_LegacyCache] = None) -> "SequenceCache":
@@ -55,6 +77,8 @@ class SequenceCache(DynamicCache):
             cache.real_seq_length = [self.real_seq_length[seq_idx]]
             if len(self.last_logits) > seq_idx:
                 cache.last_logits = [self.last_logits[seq_idx]]
+            if len(self.last_tokens) > seq_idx:
+                cache.last_tokens = [self.last_tokens[seq_idx]]
             cache.key_cache, cache.value_cache = self._apply_cache(lambda x: x[seq_idx:seq_idx + 1, ...].clone())
             results.append(cache)
         return results
@@ -70,6 +94,7 @@ class SequenceCache(DynamicCache):
         cache = SequenceCache()
         cache.seen_tokens = self.seen_tokens
         cache.last_logits = self.last_logits * repeat_times
+        cache.last_tokens = cache.last_tokens * repeat_times
         cache.real_seq_length = self.real_seq_length * repeat_times
         for key, value in zip(self.key_cache, self.value_cache):
             cache.key_cache.append(key.expand(repeat_times, -1, -1, -1))
@@ -84,6 +109,7 @@ class SequenceCache(DynamicCache):
         cache = SequenceCache()
         for sc in seq_caches:
             cache.last_logits.extend(sc.last_logits)
+            cache.last_tokens.extend(sc.last_tokens)
             cache.real_seq_length.extend(sc.real_seq_length)
         max_seq_len = max(cache.real_seq_length)
         max_layer_idx = len(seq_caches[0].key_cache)
@@ -218,26 +244,31 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         to_cache = []
         with_cache = []
         last_prefix = None
-        cached_idx = len(list(self.cache_trie.prefix(self.joined_data[self.total_prefix_num - 1][data_idx])))
-        if yield_with_cache:
-            need_cache_idx = self.total_prefix_num - 1
-        else:
-            need_cache_idx = cached_idx
+        # we need one more level of cache
+        need_cache_num = min(
+            len(list(self.cache_trie.prefix(self.joined_data[self.total_prefix_num - 1][data_idx]))) + 1,
+            self.total_prefix_num
+        )
 
         while len(to_cache) < self.cache_batch_size and data_idx < self.data_len:
-            joined_prefix = self.joined_data[need_cache_idx][data_idx]
-            cache_num = len(list(self.cache_trie.prefix(joined_prefix)))
-            if joined_prefix != last_prefix and cache_num == need_cache_idx:
-                if yield_with_cache:
-                    if len(with_cache) > 0:
-                        # logger.warning(f"Yield with cache 1: {with_cache}")
-                        return with_cache, True
-                    else:
-                        need_cache_idx = cached_idx
-                    yield_with_cache = False
-                to_cache.append(data_idx)
+            joined_prefix = self.joined_data[need_cache_num - 1][data_idx]
+            cur_cache_num = len(list(self.cache_trie.prefix(joined_prefix)))
 
-            elif yield_with_cache and cache_num == self.total_prefix_num:
+            if joined_prefix != last_prefix:
+                if yield_with_cache and cur_cache_num < self.total_prefix_num and len(with_cache) > 0:
+                    # early stopping of with_cache
+                    # logger.warning(f"Yield with cache 1: {with_cache}")
+                    return with_cache, True
+                elif cur_cache_num < self.total_prefix_num:
+                    # we failed to find any prefix with available cache, so we need to cache first
+                    yield_with_cache = False
+
+                if cur_cache_num == need_cache_num - 1:
+                    # cache the unique prefix at `need_cache_num` level, i.e., the next level of `cur_cache_num`
+                    to_cache.append(data_idx)
+
+            # if the data already has enough cache and we are sampling them
+            if yield_with_cache and cur_cache_num == self.total_prefix_num:
                 with_cache.append(data_idx)
                 # logger.warning(f"Add: {len(joined_prefix)}")
                 if len(with_cache) == self.batch_size:
@@ -246,9 +277,6 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
 
             data_idx += 1
             last_prefix = joined_prefix
-        # logger.warning(
-        #     f"Yield to cache 1: {to_cache} {with_cache} {len(to_cache)} < {self.cache_batch_size} {data_idx} < {self.data_len}"
-        # )
         if yield_with_cache:
             return with_cache, True
         else:

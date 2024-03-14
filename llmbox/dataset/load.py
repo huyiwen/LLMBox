@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging import getLogger
 from typing import TYPE_CHECKING, Union
@@ -50,6 +51,7 @@ def load_dataset(args: "DatasetArguments", model: "Model", threading: bool = Tru
     Args:
         args (Namespace): The global configurations.
         model (Model): Our class for model.
+        threading (bool): Enable multi-threading when loading multiple subsets.
 
     Returns:
         Dataset: Our class for dataset.
@@ -84,7 +86,9 @@ def load_dataset(args: "DatasetArguments", model: "Model", threading: bool = Tru
 
     # use specified subset_names if available
     subset_names = args.subset_names or available_subsets
-    logger.debug(f"{name} - available_subsets: {available_subsets}, load_args: {dataset_cls.load_args}, final subset_names: {subset_names}")
+    logger.debug(
+        f"{name} - available_subsets: {available_subsets}, load_args: {dataset_cls.load_args}, final subset_names: {subset_names}"
+    )
 
     # GPTEval requires openai-gpt
     if any(isinstance(m, GPTEval) for m in dataset_cls.metrics) and model.args.openai_api_key is None:
@@ -99,10 +103,15 @@ def load_dataset(args: "DatasetArguments", model: "Model", threading: bool = Tru
     if len(subset_names) > 1 and accepts_subset(dataset_cls.load_args, overwrite_subset=len(args.subset_names) > 0):
         # race:middle,high (several subsets) , super_glue (all the subsets)
         logger.info(f"Loading subsets of dataset `{args.dataset_name}`: " + ", ".join(subset_names))
+        first_dataset = subset_names.pop()
+        first_dataset = (first_dataset, dataset_cls(args, model, first_dataset))
         if threading and len(subset_names) >= 8:
+            logging.disable(logging.INFO)
             with ThreadPoolExecutor(max_workers=len(subset_names)) as executor:
                 res = [executor.submit(lambda s: (s, dataset_cls(args, model, s)), s) for s in subset_names]
-            datasets = dict(sorted((f.result() for f in as_completed(res)), key=lambda x: x[0]))
+            datasets = [first_dataset] + [f.result() for f in as_completed(res)]
+            datasets = dict(sorted(datasets, key=lambda x: x[0]))
+            logging.disable(logging.NOTSET)
         else:
             datasets = {s: dataset_cls(args, model, s) for s in sorted(subset_names)}
         dataset_collection = DatasetCollection(datasets)
@@ -111,12 +120,20 @@ def load_dataset(args: "DatasetArguments", model: "Model", threading: bool = Tru
     elif len(subset_names) == 1 and len(available_subsets) != 1 and accepts_subset(
         dataset_cls.load_args, overwrite_subset=len(args.subset_names) > 0, subset=next(iter(subset_names))
     ):
-        # in some cases of get_dataset_config_names() have only one subset, loading dataset with the a subset name is not allowed in huggingface datasets library
+        # load `subset_names` from `available_subsets`, so we need to specify the subset name
         # len(available_subsets) == 0 means a special case, like wmt
         # race:middle (one of the subsets), coqa (default)
         logger.info(f"Loading subset of dataset `{args.dataset_name}:{next(iter(subset_names))}`")
         return dataset_cls(args, model, next(iter(subset_names)))
     else:
+        # we don't need to specify the subset name
+        # in some cases, get_dataset_config_names() returns one subset, where you should not pass the subset name, i.e. `len(available_subsets) != 1`
         # copa (super_glue:copa) or mmlu
         logger.info(f"Loading dataset `{args.dataset_name}`")
         return dataset_cls(args, model)
+
+
+def load_datasets(args: "DatasetArguments",
+                  model: "Model",
+                  threading: bool = True) -> Union[Dataset, DatasetCollection]:
+    pass

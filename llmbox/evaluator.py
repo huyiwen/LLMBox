@@ -1,3 +1,4 @@
+import logging
 from logging import getLogger
 from statistics import mode
 from typing import Dict, Tuple
@@ -33,15 +34,9 @@ class Evaluator:
         set_seed(self.evaluation_args.seed)
 
         self.model = load_model(self.model_args)
-        if self.model_args.vllm:
-            from vllm import LLM
-
-            if isinstance(getattr(self.model, "model"), LLM):
-                self.dataset_args.batch_size = -1
-                logger.info(
-                    "Setting batch_size to -1, since vllm can automatically planning the optimal batch and order."
-                )
         self.dataset = load_dataset(self.dataset_args, self.model)
+        if self.dataset.model_evaluation_method == "get_prob":
+            self.model.constant_option_num = all(n == self.dataset.option_nums[0] for n in self.dataset.option_nums)
 
     @catch_error
     def evaluate(self) -> Dict[str, float]:
@@ -53,18 +48,18 @@ class Evaluator:
 
         Finally, we call the `calculate_metric` to get the metric score of prediction results.
         """
-        real_batch_size = self.dataset_args.batch_size
+        dataloader_batch_size = self.dataset_args.batch_size
         if self.dataset_args.batch_size == -1:
             # vllm can automatically planning the optimal batch and order
-            real_batch_size = self.dataset.len()
-        batch_sampler = self.dataset.get_batch_sampler()
+            dataloader_batch_size = self.dataset.len()
+        batch_sampler = self.dataset.get_batch_sampler(self.evaluation_args.dry_run)
         if batch_sampler is not None:
-            # batch_sampler is mutually exclusive with batch_size
-            real_batch_size = 1
+            # batch size is determined by batch_sampler, which is mutually exclusive with the batch_size option
+            dataloader_batch_size = 1
             self.model.set_cacher(batch_sampler)
         dataloader = DataLoader(
             self.dataset,
-            batch_size=real_batch_size,
+            batch_size=dataloader_batch_size,
             collate_fn=lambda x: x,
             shuffle=False,
             pin_memory=True,
@@ -110,6 +105,8 @@ class Evaluator:
         for batch in dataloader:
             batch_results = call_model(batch)
             raw_predictions.extend(batch_results)
+
+            # call_model will return an empty list when it is caching
             if len(batch_results) > 0:
                 self.dataset.log_predictions(raw_predictions)
             self.dataset.update_tqdm(dataloader, len(batch_results))
@@ -119,13 +116,14 @@ class Evaluator:
                 f"The number of results {len(raw_predictions)} should be equal to the number of samples in the dataset {self.dataset.len()}."
             )
 
-        # post processing and self-consistency
+        # post processing
         predictions = self.dataset.post_processing(raw_predictions)
         if len(predictions) != self.dataset.len(option_num=False, normalization=False):
             raise RuntimeError(
                 f"The number of results {len(predictions)} should be equal to the number of samples in the dataset {self.dataset.len(option_num=False, normalization=False)}."
             )
 
+        # pass_at_k and self-consistency
         step = self.dataset.len(option_num=False, sample_num=False, normalization=False)
         if self.dataset_args.pass_at_k:
             mode_predictions = [predictions[i::step] for i in range(step)]
@@ -141,5 +139,8 @@ class Evaluator:
             for key, value in result.items():
                 msg += "\n{}: {:.2f}".format(key, value)
 
-        logger.info(msg + "\n")
+        if logger.level > logging.INFO:
+            print(msg + "\n")
+        else:
+            logger.info(msg + "\n")
         return metric_results

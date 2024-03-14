@@ -1,9 +1,7 @@
 from logging import getLogger
-from pprint import pformat, pprint
 from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import torch
-from pytorch_memlab import LineProfiler, profile, profile_every
 from torch.nn import CrossEntropyLoss
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto import AutoModelForCausalLM, AutoTokenizer
@@ -21,8 +19,7 @@ logger = getLogger(__name__)
 _Tokenizer = Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
 
 
-def load_hf_model(args: "ModelArguments",
-                  return_postfix_tokenizer: bool = True) -> Tuple[PreTrainedModel, _Tokenizer, Optional[_Tokenizer]]:
+def load_hf_model(args: "ModelArguments") -> Tuple[PreTrainedModel, _Tokenizer]:
     logger.info(f"Loading {args.model_name_or_path} using Hugging Face Transformers...")
 
     model_kwargs = dict(
@@ -52,19 +49,6 @@ def load_hf_model(args: "ModelArguments",
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer_name_or_path, use_fast=True, padding_side="left", truncation_side="left", add_eos_token=False
     )
-    if return_postfix_tokenizer:
-        postfix_tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer_name_or_path,
-            use_fast=True,
-            padding_side="right",
-            truncation_side="right",
-            add_eos_token=False,
-            add_bos_token=False,
-        )
-        if postfix_tokenizer.pad_token is None:
-            postfix_tokenizer.pad_token = postfix_tokenizer.unk_token
-    else:
-        postfix_tokenizer = None
 
     # TODO: [Important]!!! check for each tokenizer
     if tokenizer.pad_token is None:
@@ -91,7 +75,7 @@ def load_hf_model(args: "ModelArguments",
 
     tokenizer.model_max_length = max_length
     logger.debug(f"Model: {model}\nTokenizer: {tokenizer}")
-    return model, tokenizer, postfix_tokenizer
+    return model, tokenizer
 
 
 class HuggingFaceModel(Model):
@@ -109,12 +93,7 @@ class HuggingFaceModel(Model):
                 " model type, which can be chosen from `base` and `instruction`."
             )
 
-        self.model, self.tokenizer, self.postfix_tokenizer = load_hf_model(args, args.prefix_caching)
-        self.space_token_id = -100
-        if self.postfix_tokenizer is not None:
-            input_ids = self.postfix_tokenizer(" postfix").input_ids
-            if len(input_ids) > 1:
-                self.space_token_id = input_ids[0]
+        self.model, self.tokenizer = load_hf_model(args)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     @staticmethod
@@ -124,6 +103,88 @@ class HuggingFaceModel(Model):
             if char_st == 0:
                 yield token_idx
         yield len(offset_mapping)
+
+    def _process_postfix_encodings(
+        self,
+        attention_mask: torch.Tensor,
+        prefix_cache: SequenceCache,
+        device: Optional[str] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        if device is not None:
+            device = torch.device(device)
+        else:
+            device = self.device
+        max_prefix_len = prefix_cache.get_seq_length()
+        batch_size, max_input_len = attention_mask.size()
+
+        # prepare attention_mask of prefix, and position_ids of postfix (continue from the last token of prefix)
+        prefix_mask = torch.ones((batch_size, prefix_cache.get_seq_length()), device=device)
+        if prefix_cache.get_seq_num() == 1 and batch_size > 1:
+            # same prefix for all inputs
+            prefix_cache = prefix_cache.expand_seq(batch_size)
+            prefix_lengths = [prefix_cache.get_seq_length()] * batch_size
+            input_pos = torch.arange(max_prefix_len, max_prefix_len + max_input_len,
+                                     device=device).expand(batch_size, -1)
+        else:
+            # different prefix for each input
+            prefix_lengths = []
+            input_pos = []
+            for seq_idx in range(batch_size):
+                prefix_len = prefix_cache.real_seq_length[seq_idx]
+                prefix_mask[seq_idx, :-prefix_len] = 0  # prefix is left padded
+                prefix_lengths.append(prefix_len)
+                input_pos.append(torch.arange(prefix_len, max_input_len + prefix_len))
+            input_pos = torch.stack(input_pos).to(device)
+
+        # concatenate the prefix and input attention_mask
+        attention_mask = torch.cat([prefix_mask, attention_mask], dim=1).to(device)  # type: ignore
+        return attention_mask, input_pos, prefix_lengths
+
+    def _tokenize_postfix(
+        self,
+        batched_inputs: List[str],
+        prefix_cache: Optional[SequenceCache] = None,
+        device: Optional[str] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+
+        batch_size = len(batched_inputs)
+        _to = dict(dtype=torch.long, device=self.device)
+        if device is not None:
+            _to["device"] = torch.device(device)
+
+        # tokenize the postfix like a postfix. this is useful to handle tokenizers like llama
+        if prefix_cache is not None and prefix_cache.last_tokens is not None:
+            batched_inputs = [l + p for l, p in zip(prefix_cache.last_tokens, batched_inputs)]
+
+        # use the same tokenizer, but different padding strategy
+        batched_encodings = self.tokenizer(batched_inputs)
+
+        # remove the prefix from the input_ids and get the batched_ids for postfix
+        if prefix_cache is not None and prefix_cache.last_tokens is not None:
+            ids_slice = [
+                slice(batched_encodings.char_to_token(i, len(l)), self.tokenizer.model_max_length)
+                for i, l in enumerate(prefix_cache.last_tokens)
+            ]
+        else:
+            ids_slice = [slice(0, self.tokenizer.model_max_length)] * batch_size
+        batched_ids = [i[slc] for i, slc in zip(batched_encodings["input_ids"], ids_slice)]
+        input_lengths = [len(seq) for seq in batched_ids]
+        max_input_len = max(input_lengths)
+
+        # pad the input_ids and attention_mask
+        input_ids = torch.full((batch_size, max_input_len), self.tokenizer.pad_token_id, **_to)
+        attention_mask = torch.zeros((batch_size, max_input_len), **_to)
+        for i, ids in enumerate(batched_ids):
+            input_ids[i, :len(ids)] = torch.tensor(ids, **_to)
+            attention_mask[i, :len(ids)] = 1
+
+        if prefix_cache is not None:
+            attention_mask, input_pos, prefix_lengths = self._process_postfix_encodings(attention_mask, prefix_cache)
+        else:
+            prefix_lengths = [0] * batch_size
+            input_pos = None
+
+        return input_ids, attention_mask, input_pos, prefix_lengths, input_lengths
 
     # @profile_every(enable=False)
     def get_cache(
@@ -149,53 +210,12 @@ class HuggingFaceModel(Model):
                 raise RuntimeError(
                     f"The number of sentence in prefix_cache should be one or be equal to the batch size {batch_size}"
                 )
-            _tokenizer = self.postfix_tokenizer
-        else:
-            _tokenizer = self.tokenizer
 
-        # keeps the arguments the same as get_ppl, except for arguments specified at the tokenizer class level
-        batched_encodings = _tokenizer(
-            batched_inputs,
-            padding=True,
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors="pt",
-        )  # type: ignore
-        input_ids = batched_encodings["input_ids"]
-        attention_mask = batched_encodings["attention_mask"]
-        # logger.info(f"Space {self.space_token_id}")
-        if input_ids[:, :1].eq(self.space_token_id).all():
-            input_ids = input_ids[:, 1:]
-            attention_mask = attention_mask[:, 1:]
-        input_lengths = [len(am.nonzero()) for am in attention_mask]
-        max_input_len = max(input_lengths)
-        input_ids = input_ids.to(self.device)
-        attention_mask = attention_mask.to(self.device)
-
-        # logger.info(f"{batched_inputs} {input_ids} {attention_mask} {input_lengths}")
+        input_ids, attention_mask, input_pos, prefix_lengths, input_lengths = self._tokenize_postfix(
+            batched_inputs, prefix_cache
+        )
         if prefix_cache is not None:
-            max_prefix_len = prefix_cache.get_seq_num()
-            prefix_mask = torch.ones((batch_size, prefix_cache.get_seq_length()), device=self.device)
-            if cache_num == 1 and batch_size > 1:
-                prefix_cache = prefix_cache.expand_seq(batch_size)
-                prefix_lengths = [prefix_cache.get_seq_length()] * batch_size
-                input_pos = torch.arange(max_prefix_len, max_input_len + max_prefix_len,
-                                         device=self.device).expand(batch_size, -1)
-            else:
-                prefix_lengths = []
-                input_pos = []
-                for seq_idx in range(batch_size):
-                    prefix_len = prefix_cache.real_seq_length[seq_idx]
-                    prefix_mask[seq_idx, :-prefix_len] = 0
-                    prefix_lengths.append(prefix_len)
-                    input_pos.append(torch.arange(prefix_len, max_input_len + prefix_len))
-                input_pos = torch.stack(input_pos).to(self.device)
-            attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)  # type: ignore
             prefix_cache = prefix_cache.to_legacy_cache()  # type: ignore
-        else:
-            max_prefix_len = 0
-            prefix_lengths = [0] * batch_size
-            input_pos = None
 
         with torch.no_grad():
             results = self.model(
@@ -210,6 +230,8 @@ class HuggingFaceModel(Model):
         if return_caches:
             # store the non-padding parts of caches to ensure the correct creation of position_ids when using
             # these caches in the future
+            max_prefix_len = max(prefix_lengths)
+            max_input_len = input_ids.size(1)
             caches = SequenceCache.from_legacy_cache(results.past_key_values).split_by_seq()
             for idx, seq_cache in enumerate(caches):
                 seq_cache.remove_paddings(
@@ -217,23 +239,24 @@ class HuggingFaceModel(Model):
                     num_r=max_input_len - input_lengths[idx],
                 )
                 if save_last_logits:
-                    seq_cache.last_logits = [logits[idx:idx + 1, -1:, :].clone()]
+                    p = input_lengths[idx]
+                    seq_cache.set_last_logits(logits[idx:idx + 1, p - 1:p, :].clone())
+                seq_cache.set_last_tokens(batched_inputs[idx].rsplit(" ", 1)[-1])
             return caches
         else:
             return logits, input_ids, input_lengths
 
     def get_ppl_with_cache(self, batched_targets: List[str], prefix_cache: SequenceCache) -> List[Tuple[float, int]]:
         logits, labels, input_lengths = self.get_cache(batched_targets, prefix_cache, return_caches=False)
-        last_logits = torch.cat(prefix_cache.last_logits).to(logits.device)
+        last_logits = torch.cat(prefix_cache.last_logits, dim=0).to(logits.device)
         shift_logits = torch.cat([last_logits, logits[:, :-1]], dim=-2)
         labels[labels == self.tokenizer.pad_token_id] = -100
         probs = self.loss_fct(shift_logits.view(-1, self.model.config.vocab_size),
-                              labels.view(-1)).view(labels.size(0), -1).cpu()
+                              labels.view(-1)).view(labels.size(0), -1)
 
-        ppls = []
-        for prob, tgt_len in zip(probs, input_lengths):
-            ppl = sum(prob.tolist()[:tgt_len])
-            ppls.append((ppl, tgt_len))
+        print(labels)
+        print(input_lengths)
+        ppls = [(probs[idx, :tgt_len].sum().item(), tgt_len) for idx, tgt_len in enumerate(input_lengths)]
         return ppls
 
     def set_ppl_args(self, **extra_model_args):
@@ -243,11 +266,11 @@ class HuggingFaceModel(Model):
         if len(extra_model_args) > 0:
             logger.warning(f"Unused generation arguments: {extra_model_args}")
 
-    def get_ppl(self, batched_inputs: List[Tuple[str, ...]]) -> List[Tuple[float, int]]:
+    def get_ppl(self, batched_inputs: List[Tuple[str, ...]], use_cache: bool = True) -> List[Tuple[float, int]]:
         if not self._ppl_args_set:
             logger.warning(f"Please set the get_ppl arguments using `set_ppl_args` before calling `get_ppl`.")
 
-        if self.cacher is not None:
+        if use_cache and self.cacher is not None:
             *prefix_groups, targets = list(map(list, zip(*batched_inputs)))
             batch_num = len(prefix_groups[0])
 
@@ -267,16 +290,15 @@ class HuggingFaceModel(Model):
                 self.cacher.set_cache(p, c, cached_num)
             return []
 
-        prompt = [src + tgt for src, tgt in batched_inputs]
+        prompt = ["".join(pg) for pg in batched_inputs]
 
         batched_encodings = self.tokenizer(
             prompt,
             padding=True,
             truncation=True,
-            return_offsets_mapping=True,
             return_attention_mask=True,
             return_tensors="pt",
-        ).to(self.device)
+        ).to(device=self.device)
 
         with torch.no_grad():
             logits = self.model(
@@ -286,25 +308,13 @@ class HuggingFaceModel(Model):
             shift_labels = batched_encodings["input_ids"][:, 1:].contiguous()
             shift_labels[shift_labels == self.tokenizer.pad_token_id] = -100
             probs = self.loss_fct(shift_logits.view(-1, self.model.config.vocab_size),
-                                  shift_labels.view(-1)).view(shift_labels.size(0), -1).cpu()
-        # logger.info(f"Getppl {shift_logits}, {probs}")
+                                  shift_labels.view(-1)).view(shift_labels.size(0), -1)
 
-        ppls = []
-        for prob, (src, _), offset, attention_mask in zip(
-            probs, batched_inputs, batched_encodings.offset_mapping, batched_encodings.attention_mask
-        ):
-            ppl = [None] + prob.tolist()
-            offset = [st for st, ed in offset]
-            tgt_start = max(
-                # the start index of the last token in source
-                offset.index(len(src)),
-                # the second nonzero token (the first nonzero token is " " if source is empty)
-                attention_mask.nonzero()[0][0].item() + 1,
-            )
-            tgt_end = len(offset)
-            # logger.info(ppl[tgt_start:])
-            ppl = sum(ppl[tgt_start:])
-            ppls.append((ppl, tgt_end - tgt_start))
+        src_lengths = [len("".join(pg[:-1])) for pg in batched_inputs]
+        tgt_starts = [batched_encodings.char_to_token(i, l) for i, l in enumerate(src_lengths)]
+        ed = len(batched_encodings["input_ids"][0])
+        print(tgt_starts, ed)
+        ppls = [(probs[idx, st - 1:].sum().item(), ed - st) for idx, st in enumerate(tgt_starts)]
         return ppls
 
     def set_generation_args(self, **extra_model_args):
@@ -379,6 +389,7 @@ class HuggingFaceModel(Model):
         self._token_labels = []
         self._word_labels = []
         self._candidate_ids = extra_model_args.pop("candidate_ids", None)
+        self.constant_option_num = extra_model_args.pop("constant_option_num", False)
 
         self._prob_args_set = True
         if len(extra_model_args) > 0:
@@ -403,28 +414,32 @@ class HuggingFaceModel(Model):
         batched_option_nums: List[int],
         prefix_cache: SequenceCache,
     ) -> List[List[float]]:
-        logits, _, _ = self.get_cache(batched_inputs, prefix_cache, return_caches=False)
-        batch_logits = logits.detach()[:, -1, :]
+        logits, _, input_lengths = self.get_cache(batched_inputs, prefix_cache, return_caches=False)
+        input_lengths = [i - 1 for i in input_lengths]
+        logits = logits[range(len(input_lengths)), input_lengths, :]
 
         answers = []
-        for i, option_num in enumerate(batched_option_nums):
-            label_ids = self._get_label_ids(option_num)
-            answers.append(torch.softmax(batch_logits[i, label_ids], dim=-1, dtype=torch.float32).tolist())
+        if self.constant_option_num:
+            label_ids = self._get_label_ids(batched_option_nums[0])
+            answers = torch.softmax(logits[:, label_ids], dim=-1, dtype=torch.float32).tolist()
+        else:
+            for i, option_num in enumerate(batched_option_nums):
+                label_ids = self._get_label_ids(option_num)
+                answers.append(torch.softmax(logits[i, label_ids], dim=-1, dtype=torch.float32).tolist())
         return answers
 
-    def get_prob(self, batched_inputs: List[Tuple[str, int]]) -> List[List[float]]:
+    def get_prob(self, batched_inputs: List[Tuple[str, int]], use_cache: bool = True) -> List[List[float]]:
         if not self._prob_args_set:
             logger.warning(f"Please set the get_prob arguments using `set_prob_args` before calling `get_prob`.")
 
-        if self.cacher is not None:
+        if self.cacher is not None and use_cache:
             *batched_prompts, batched_option_nums = map(list, zip(*batched_inputs))
             batch_num = len(batched_prompts[0])
 
-            # if cache is available, get_ppl_with_cache
+            # if cache is available, get_prob_with_cache
             all_prefix = ["".join(pg[i] for pg in batched_prompts) for i in range(batch_num)]
             prefix_cache, cached_num = self.cacher.get_cache(all_prefix)
             if prefix_cache is not None and cached_num == len(batched_prompts) - 1:
-                # logger.warning(f"get_prob_with_cache, {cached_num} {len(batched_prompts)}")
                 return self.get_prob_with_cache(batched_prompts[-1], batched_option_nums, prefix_cache)
 
             # pass the input without prefix text to the model
@@ -450,6 +465,10 @@ class HuggingFaceModel(Model):
                 attention_mask=batched_encodings["attention_mask"].to(self.device),
             ).logits.detach()[:, -1]  # padding_side="left" in tokenizer
 
+        if self.constant_option_num:
+            label_ids = self._get_label_ids(batched_option_nums[0])
+            answers = torch.softmax(batch_logits[:, label_ids], dim=-1, dtype=torch.float32).tolist()
+        else:
             answers = []
             for i, option_num in enumerate(batched_option_nums):
                 label_ids = self._get_label_ids(option_num)

@@ -24,10 +24,11 @@ class Hellaswag(MultipleChoiceDataset):
     instruction = ""
     evaluation_set = "validation"
     example_set = "train"
-    load_args = ("hellaswag",)
+    load_args = ("Rowan/hellaswag",)
 
     @staticmethod
     def preprocess(text):
+        # https://github.com/EleutherAI/lm-evaluation-harness/blob/a3e56afeab01d1a847ecf37cfed35ffeec2c0150/lm_eval/tasks/hellaswag/utils.py#L6
         text = text.strip()
         text = text.replace(" [title]", ". ")
         text = re.sub("\\[.*?\\]", "", text)
@@ -35,6 +36,7 @@ class Hellaswag(MultipleChoiceDataset):
         return text
 
     def format_instance(self, instance):
+        # https://github.com/EleutherAI/lm-evaluation-harness/blob/a3e56afeab01d1a847ecf37cfed35ffeec2c0150/lm_eval/tasks/hellaswag/utils.py#L15
         source = self.preprocess(
             instance["activity_label"] + ": " + instance["ctx_a"] + " " + instance["ctx_b"].capitalize()
         )

@@ -11,13 +11,10 @@ import pandas as pd
 import torch
 
 from ..model.huggingface_model import HuggingFaceModel
+from ..model.vllm_model import vllmModel
 from ..utils import dynamic_stride_tqdm
 from ..utils.cache_prefix_sampler import CachePrefixSampler
-from .icl_strategies import (
-    ape,
-    global_entropy_ordering_strategy,
-    knn_construct_examples,
-)
+from .icl_strategies import (ape, global_entropy_ordering_strategy, knn_construct_examples)
 from .utils import get_raw_dataset_loader
 
 if typing.TYPE_CHECKING:
@@ -153,6 +150,13 @@ class Dataset(torch.utils.data.Dataset):
 
         extra_model_args = copy(self.extra_model_args)
 
+        if isinstance(self.model, vllmModel):
+            self.args.batch_size = -1
+            if self.args.batch_size != -1 or self.args.batch_size != 1:
+                logger.warning(
+                    "Setting batch_size to -1, since vllm can automatically planning the optimal batch and order."
+                )
+
         # sample num
         if self.args.sample_num > 1 and self.model_evaluation_method in {"get_ppl", "get_prob"}:
             self.args.sample_num = 1
@@ -181,7 +185,7 @@ class Dataset(torch.utils.data.Dataset):
             self.model_evaluation_method not in {"get_ppl", "get_prob"} or not isinstance(self.model, HuggingFaceModel)
         ):
             logger.warning(
-                "Prefix caching is only available for HuggingFaceModel.get_ppl(). Automatically set prefix_caching to False"
+                "Prefix caching is only available for get_ppl or get_prob method of HuggingFaceModel. Automatically set prefix_caching to False"
             )
             self.model.args.prefix_caching = False
 
@@ -347,11 +351,11 @@ class Dataset(torch.utils.data.Dataset):
                     self.option_nums.append(len(contexts))
 
             logger.info("Evaluation mode: calculate PPL of the optional text based on the source text")
-            logger.info("Formatted example (source)\n" + pformat(self.evaluation_instances[0][0]))
-            logger.info(f"Formatted example (option)\n" + pformat(self.evaluation_instances[0][1]))
+            logger.info("Formatted example (source)\n" + pformat(self.evaluation_instances[0][:-1]))
+            logger.info(f"Formatted example (option)\n" + pformat(self.evaluation_instances[0][-1]))
             if len(self.evaluation_instances) > 1:
-                logger.debug("Next formatted example (source)\n" + pformat(self.evaluation_instances[1][0]))
-                logger.debug("Next formatted example (option)\n" + pformat(self.evaluation_instances[1][1]))
+                logger.debug("Next formatted example (source)\n" + pformat(self.evaluation_instances[1][0:-1]))
+                logger.debug("Next formatted example (option)\n" + pformat(self.evaluation_instances[1][-1]))
 
         elif self.model_evaluation_method == "generation":
             for formatted_instance in self.formatted_evaluation_data:
@@ -736,9 +740,9 @@ class Dataset(torch.utils.data.Dataset):
             )
             return None
 
-    def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
+    def get_batch_sampler(self, disable: bool = False) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
-            if self.model.args.prefix_caching and isinstance(self.model, HuggingFaceModel):
+            if not disable and self.model.args.prefix_caching and isinstance(self.model, HuggingFaceModel):
                 cache_prefix_level = -1 if self.model_evaluation_method == "get_prob" else None
                 self._batch_sampler = CachePrefixSampler(
                     data=self,
@@ -849,9 +853,9 @@ class DatasetCollection(torch.utils.data.Dataset):
                 yield {k: v[st:st + dlen] for k, v in obj.items()}
                 st += dlen
 
-    def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
+    def get_batch_sampler(self, disable: bool = False) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
-            if self._datasets[0].model.args.prefix_caching and isinstance(self.model, HuggingFaceModel):
+            if not disable and self._datasets[0].model.args.prefix_caching and isinstance(self.model, HuggingFaceModel):
                 cache_prefix_level = -1 if self._datasets[0].model_evaluation_method == "get_prob" else None
                 self._batch_sampler = CachePrefixSampler(
                     data=self,
