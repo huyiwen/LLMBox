@@ -1,5 +1,9 @@
 import re
 import signal
+from typing import Optional
+
+from llmbox.model.model import Model
+from llmbox.utils.arguments import DatasetArguments
 
 from ..metric import Accuracy
 from .generation_dataset import GenerationDataset
@@ -25,6 +29,11 @@ class Gsm8k(GenerationDataset):
     _decimal_separator = re.compile(r"(\d),(\d)")
     _extract_numbers = re.compile(r"[-+]?\d*\.\d+|\d+")
 
+    def __init__(self, args: DatasetArguments, model: Model, subset_name: Optional[str] = None):
+        if model.type == 'base':
+            self.extra_model_args['stop'] = ['\n', '\n\n']
+        super().__init__(args, model, subset_name)
+
     def load_raw_dataset(self, dataset_path, subset_name, evaluation_set, example_set):
         super().load_raw_dataset(dataset_path, subset_name, evaluation_set, example_set)
         if self.args.cot == 'base':
@@ -34,9 +43,6 @@ class Gsm8k(GenerationDataset):
         elif self.args.cot == 'pal':
             self.example_data = PAL_EXAMPLARS
             self.instruction = "Let's use python to solve math problems. Here are some examples how to do it."
-
-        if self.model.type == 'base':
-            self.extra_model_args['stop'] = ['\n']
 
     def post_processing(self, predictions):
         new_predictions = []
@@ -85,6 +91,7 @@ class Gsm8k(GenerationDataset):
 
 
 class Timeout:
+
     def __init__(self, seconds=10, error_message='Timeout'):
         self.seconds = seconds
         self.error_message = error_message

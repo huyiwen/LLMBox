@@ -51,7 +51,7 @@ class Dataset(torch.utils.data.Dataset):
         - `option_nums (List[int])`: The number of options for each evaluation instance.
     """
 
-    instruction: str
+    instruction: str = ""
     r"""Dataset-specific instruction for the task."""
 
     metrics: List["Metric"]
@@ -359,12 +359,16 @@ class Dataset(torch.utils.data.Dataset):
 
         elif self.model_evaluation_method == "generation":
             for formatted_instance in self.formatted_evaluation_data:
-                self.evaluation_instances.append(self.format_instruction_and_examples(formatted_instance))
+                self.evaluation_instances.append(
+                    self.format_instruction_and_examples(
+                        formatted_instance, split_prefix=self.model.args.prefix_caching
+                    )
+                )
 
             logger.info("Evaluation mode: generation based on the source text")
-            logger.info("Formatted example (source)\n" + self.evaluation_instances[0])
+            logger.info("Formatted example (source)\n" + pformat(self.evaluation_instances[0]))
             if len(self.evaluation_instances) > 1:
-                logger.debug("Next formatted example (source)\n" + self.evaluation_instances[1])
+                logger.debug("Next formatted example (source)\n" + pformat(self.evaluation_instances[1]))
 
         elif self.model_evaluation_method == "get_prob":
             for formatted_instance in self.formatted_evaluation_data:
@@ -485,7 +489,7 @@ class Dataset(torch.utils.data.Dataset):
             instruction = self.instruction + "\n\n" if self.model.type == "instruction" else ""
             source = self.args.instance_format.format(source=instance["source"], target="")
             results = [instruction, self.examples, source]
-            if split_prefix:  # to support prefix_caching for get_ppl
+            if split_prefix:  # to support prefix_caching
                 return [p for p in results if len(p) > 0]
             else:
                 return "".join(results)
@@ -611,6 +615,15 @@ class Dataset(torch.utils.data.Dataset):
             for _ in range(n):
                 yield from obj
 
+        def repeat_by_option(*arr):
+
+            def wrapper():
+                for cols in zip(range(len(self.option_nums)), *arr):
+                    for _ in range(self.option_nums[cols[0]]):
+                        yield (*cols, self.option_nums[cols[0]])
+
+            return zip(*wrapper())
+
         def to_dict(merge: Optional[List[str]] = None, merge_by_option: Optional[List[str]] = None):
             merge = merge or []
             merge_by_option = merge_by_option or []
@@ -630,15 +643,18 @@ class Dataset(torch.utils.data.Dataset):
         if processed_predictions is None:
             # log intermediate results only
             if not hasattr(self, "_lines_iter"):
+                references = self.references
+                if self.model_evaluation_method == "get_ppl":
+                    _, references, _ = repeat_by_option(references)
                 self._lines_iter = zip(
-                    range(self.len()), self.evaluation_instances, repeat_iter(self.references, self.args.sample_num)
+                    range(self.len()), self.evaluation_instances, repeat_iter(references, self.args.sample_num)
                 )
             # append latest intermediate results to the file until line_iter is exhausted
             for idx, source, reference in self._lines_iter:
                 lines = {
                     "index": idx,
                     "source": source,
-                    "raw_prediction": raw_predictions[-1],
+                    "raw_prediction": raw_predictions,
                     "reference": reference,
                 }
                 if _to_json:
@@ -671,15 +687,6 @@ class Dataset(torch.utils.data.Dataset):
                 return None
 
         elif self.model_evaluation_method == "get_ppl":  # ranking
-
-            def repeat_by_option(*arr):
-
-                def wrapper():
-                    for cols in zip(range(len(self.option_nums)), *arr):
-                        for _ in range(self.option_nums[cols[0]]):
-                            yield (*cols, self.option_nums[cols[0]])
-
-                return zip(*wrapper())
 
             *source_texts, target_text = zip(*self.evaluation_instances)
             batch_size = len(target_text)

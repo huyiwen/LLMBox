@@ -1,11 +1,10 @@
 from collections import OrderedDict, defaultdict
 from logging import getLogger
-from pprint import pformat
+from statistics import mode
 from typing import Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 from cyac import Trie
-from pytorch_memlab import profile, profile_every
 from torch.utils.data.sampler import Sampler
 from transformers import DynamicCache
 
@@ -26,6 +25,7 @@ class SequenceCache(DynamicCache):
         self.last_logits: List[torch.Tensor] = []  # used in `get_ppl` to concatenate logits
         self.last_tokens: List[str] = []  # used in `get_cache` to concatenate tokens
         self.real_seq_length: List[int] = []
+        self.cache_level = None
 
     def set_last_tokens(self, last_tokens: Union[str, List[str]]):
         if isinstance(last_tokens, str):
@@ -53,10 +53,11 @@ class SequenceCache(DynamicCache):
         """Converts a cache in the legacy cache format into an equivalent `DynamicCache`."""
         cache = SequenceCache()
         if past_key_values is not None:
+            batch_size, _, seq_len, _ = past_key_values[0][0].shape
             for key_states, value_states in past_key_values:
                 cache.key_cache.append(key_states.detach())
                 cache.value_cache.append(value_states.detach())
-            cache.real_seq_length = [past_key_values[0][0].shape[2]] * past_key_values[0][0].shape[0]
+            cache.real_seq_length = [seq_len] * batch_size
         return cache
 
     def get_seq_num(self) -> int:
@@ -69,6 +70,7 @@ class SequenceCache(DynamicCache):
                 self.key_cache[layer_idx] = self.key_cache[layer_idx][..., num_l:-num_r, :]
                 self.value_cache[layer_idx] = self.value_cache[layer_idx][..., num_l:-num_r, :]
             self.seen_tokens = self.seen_tokens - num_l - num_r
+        # logger.warning(f"Remove paddings: {num_l}, {num_r}, {self.real_seq_length}")
 
     def split_by_seq(self) -> List["SequenceCache"]:
         results = []
@@ -114,6 +116,7 @@ class SequenceCache(DynamicCache):
         max_seq_len = max(cache.real_seq_length)
         max_layer_idx = len(seq_caches[0].key_cache)
         cache.seen_tokens = max_seq_len
+        # logger.warning(f"Pad and stack: {max_seq_len}, {max_layer_idx}, {cache.real_seq_length}")
 
         for layer_idx in range(max_layer_idx):
             key_list = []
@@ -177,22 +180,12 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
 
         self.total_prefix_num = cache_prefix_level
         self.joined_data = [[] for _ in range(self.total_prefix_num)]
-        self.postfix_nums = [[] for _ in range(self.total_prefix_num)]
         self.postfix_nums_2 = defaultdict(int)
-        self.cache_range = defaultdict(lambda: [-1, -1])
-        """A mapping from `source` text to its corresponded largest index in `self.data`"""
 
         for s_idx, (*src, _) in enumerate(self.data):
             for p_idx in range(self.total_prefix_num):
                 joined_src = "".join(src[:p_idx + 1])
                 self.joined_data[p_idx].append(joined_src)
-                last_s = self.cache_range[joined_src][1] if joined_src in self.cache_range else None
-                if last_s is None or joined_src != self.joined_data[p_idx][last_s]:
-                    self.postfix_nums[p_idx].append(1)
-                    self.cache_range[joined_src][0] = s_idx  # start
-                else:
-                    self.postfix_nums[p_idx][-1] += 1
-                self.cache_range[joined_src][1] = s_idx + 1  # end
                 self.postfix_nums_2[joined_src] += 1
 
     def get_cache(self, sources: List[str]) -> Tuple[Optional[SequenceCache], int]:
@@ -203,30 +196,26 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
             prefix_num (`int`): The number of prefixes that are matched in the cache.
         """
         caches = []
-        prefix_num = -1
         for src in sources:
             results = list(self.cache_trie.prefix(src))
             # check all sources have the same prefix number
-            if prefix_num != -1 and len(results) != prefix_num:
-                raise RuntimeError(f"Inconsistent prefix number {len(results)} != {prefix_num}\n{src}")
-            prefix_num = len(results)
 
-            if prefix_num > 0:
-                trie_idx = int(results[-1][0])
+            if len(results) > 0:
+                data = self.cache_data[int(results[-1][0])]
                 # logger.warning(f"G{trie_idx}")
-                caches.append(self.cache_data[trie_idx])
+                caches.append(data)
+                cache_level = data.cache_level
             else:
                 return None, 0
 
-        if prefix_num is None:
-            raise RuntimeError("No prefix number")
-        # logger.warning(f"Get cache: {sources}, {prefix_num}")
-        return SequenceCache.pad_and_stack(caches), prefix_num
+        # logger.warning(f"Get cache: {sources}, {cache_level}")
+        return SequenceCache.pad_and_stack(caches), cache_level
 
     def set_cache(self, src: str, cache: SequenceCache, prefix_num: int):
         if self.data_idx is None:
             raise RuntimeError("Cache can only be set during iteration.")
 
+        cache.cache_level = prefix_num + 1
         trie_idx = self.cache_trie.insert(src)
         # logger.warning(f"S{trie_idx}")
         if trie_idx > len(self.cache_data):
@@ -237,22 +226,30 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         else:
             self.cache_data[trie_idx] = cache
 
+        # logger.warning(f"Set cache: {src}, {prefix_num}")
         self.queued_size[prefix_num] += self.postfix_nums_2[src]
         self.cache_idx[prefix_num] += 1
+
+    def _get_cache_level(self, data_idx: int, max_cache_level: int) -> int:
+        cache_level = 0
+        source = self.joined_data[max_cache_level - 1][data_idx]
+        prefix_lengths = set(map(lambda x: x[1], self.cache_trie.prefix(source)))
+        for i in range(max_cache_level):
+            if len(self.joined_data[i][data_idx]) in prefix_lengths:
+                cache_level += 1
+        return cache_level
 
     def fetch_to_cache(self, data_idx: int, yield_with_cache: bool) -> Tuple[List[int], bool]:
         to_cache = []
         with_cache = []
         last_prefix = None
         # we need one more level of cache
-        need_cache_num = min(
-            len(list(self.cache_trie.prefix(self.joined_data[self.total_prefix_num - 1][data_idx]))) + 1,
-            self.total_prefix_num
-        )
+        need_cache_num = min(self._get_cache_level(data_idx, self.total_prefix_num) + 1, self.total_prefix_num)
 
         while len(to_cache) < self.cache_batch_size and data_idx < self.data_len:
             joined_prefix = self.joined_data[need_cache_num - 1][data_idx]
-            cur_cache_num = len(list(self.cache_trie.prefix(joined_prefix)))
+            cur_cache_num = self._get_cache_level(data_idx, need_cache_num)
+            # logger.warning(f">>> {data_idx} '{self.joined_data[need_cache_num - 1][data_idx]}'")
 
             if joined_prefix != last_prefix:
                 if yield_with_cache and cur_cache_num < self.total_prefix_num and len(with_cache) > 0:
@@ -277,6 +274,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
 
             data_idx += 1
             last_prefix = joined_prefix
+        # logger.warning(f"Yield to cache??: {to_cache} {with_cache}")
         if yield_with_cache:
             return with_cache, True
         else:
