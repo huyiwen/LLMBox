@@ -430,8 +430,8 @@ class Dataset(torch.utils.data.Dataset):
         if "source_postfix" in formatted_instance:
             formatted_instance["source"] += formatted_instance.pop("source_postfix")
 
-        if not formatted_instance["target"].startswith(" "):
-            formatted_instance["target"] = " " + formatted_instance["target"]
+        # remove redundant spaces
+        formatted_instance["target"] = " " + formatted_instance["target"].lstrip()
 
         if format_example and "source_idx" in formatted_instance:
             formatted_instance["source"] = formatted_instance["source"][formatted_instance.pop("source_idx")]
@@ -750,12 +750,9 @@ class Dataset(torch.utils.data.Dataset):
     def get_batch_sampler(self, disable: bool = False) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
             if not disable and self.model.args.prefix_caching and isinstance(self.model, HuggingFaceModel):
-                cache_prefix_level = -1 if self.model_evaluation_method == "get_prob" else None
                 self._batch_sampler = CachePrefixSampler(
                     data=self,
                     batch_size=self.args.batch_size,
-                    cache_batch_size=self.args.batch_size // 4,
-                    cache_prefix_level=cache_prefix_level,
                 )
             else:
                 self._batch_sampler = None
@@ -863,12 +860,9 @@ class DatasetCollection(torch.utils.data.Dataset):
     def get_batch_sampler(self, disable: bool = False) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
             if not disable and self._datasets[0].model.args.prefix_caching and isinstance(self.model, HuggingFaceModel):
-                cache_prefix_level = -1 if self._datasets[0].model_evaluation_method == "get_prob" else None
                 self._batch_sampler = CachePrefixSampler(
                     data=self,
                     batch_size=self.args.batch_size,
-                    cache_batch_size=self.args.batch_size // 4,
-                    cache_prefix_level=cache_prefix_level,
                 )
             else:
                 self._batch_sampler = None

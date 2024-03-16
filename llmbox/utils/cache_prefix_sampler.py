@@ -1,7 +1,5 @@
-from collections import OrderedDict, defaultdict
 from logging import getLogger
-from statistics import mode
-from typing import Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 from cyac import Trie
@@ -96,7 +94,7 @@ class SequenceCache(DynamicCache):
         cache = SequenceCache()
         cache.seen_tokens = self.seen_tokens
         cache.last_logits = self.last_logits * repeat_times
-        cache.last_tokens = cache.last_tokens * repeat_times
+        cache.last_tokens = [self.last_tokens[0]] * repeat_times  # repeat a list of strings
         cache.real_seq_length = self.real_seq_length * repeat_times
         for key, value in zip(self.key_cache, self.value_cache):
             cache.key_cache.append(key.expand(repeat_times, -1, -1, -1))
@@ -139,16 +137,16 @@ class SequenceCache(DynamicCache):
         return cache
 
     def __repr__(self) -> str:
-        return f"SequenceCache(real_seq_length={self.real_seq_length})"
+        return f"SequenceCache(real_seq_length={self.real_seq_length}, last_tokens={self.last_tokens}, last_logits=[{repr(self.last_logits[0].shape) + '] * ' + str(len(self.last_logits)) if self.last_logits else ']'})"
 
 
 class Cacher:
     """A base class that supports caching for a list of sources."""
 
-    def get_cache(self, sources: List[str]) -> Tuple[Optional[SequenceCache], int]:
+    def get_cache(self) -> Tuple[Optional[SequenceCache], int]:
         raise NotImplementedError
 
-    def set_cache(self, src: str, cache: SequenceCache, prefix_num: int):
+    def set_cache(self, caches: List[SequenceCache]):  # -> Any:# -> Any:
         raise NotImplementedError
 
 
@@ -159,102 +157,143 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         self,
         data: Sequence[Tuple[str, ...]],
         batch_size: int,
-        cache_prefix_level: Optional[int] = None,
-        cache_batch_size: Optional[int] = None,
     ):
         self.data = data
-        self.batch_size = batch_size
-        self.cache_batch_size = cache_batch_size if cache_batch_size else batch_size
         self.data_idx = None
-        """The index of the data that is currently being processed."""
-        # print(data, option_nums, len(data), len(option_nums))
-        # exit()
 
         # split data into (src,) and (src, tgt)
-        if cache_prefix_level is None:
-            cache_prefix_level = len(self.data[0]) - 1
-        elif cache_prefix_level < 0:
-            cache_prefix_level = len(self.data[0]) + cache_prefix_level - 1
-        else:
-            cache_prefix_level = min(cache_prefix_level, len(self.data[0]) - 1)
-
-        self.total_prefix_num = cache_prefix_level
+        self.total_prefix_num = len([1 for i in self.data[0] if isinstance(i, str)])
         self.joined_data = [[] for _ in range(self.total_prefix_num)]
-        self.postfix_nums_2 = defaultdict(int)
+        self.cache_levels = [0] * len(self.data)
+        cache_batch_size = (batch_size + 3) // 4
+        self.cache_batch_size = [cache_batch_size] * (self.total_prefix_num - 1) + [batch_size]
 
-        for s_idx, (*src, _) in enumerate(self.data):
+        self.cache: Dict[Tuple[int, int], SequenceCache] = dict()
+
+        self.next_data_idx = [dict() for _ in range(self.total_prefix_num)]
+        last_start_idx = [0 for _ in range(self.total_prefix_num)]
+        data_len = len(self.data)
+        for s_idx, src in enumerate(self.data):
             for p_idx in range(self.total_prefix_num):
                 joined_src = "".join(src[:p_idx + 1])
                 self.joined_data[p_idx].append(joined_src)
-                self.postfix_nums_2[joined_src] += 1
+                if s_idx > 0 and joined_src != self.joined_data[p_idx][s_idx - 1]:
+                    if last_start_idx[p_idx] + 1 != s_idx:
+                        self.next_data_idx[p_idx][last_start_idx[p_idx]] = s_idx
+                    last_start_idx[p_idx] = s_idx
+        for p_idx in range(self.total_prefix_num):
+            if last_start_idx[p_idx] + 1 != data_len:
+                self.next_data_idx[p_idx][last_start_idx[p_idx]] = data_len
 
-    def get_cache(self, sources: List[str]) -> Tuple[Optional[SequenceCache], int]:
+        self.data_order_with_cache: List[List[int]] = []
+        self.data_cache_level = []
+        is_cache_ready = [0 for _ in range(self.total_prefix_num)]
+        self.order_idx_by_cache = [None] * self.total_prefix_num
+        for data_idx in range(data_len):
+            for i in range(self.total_prefix_num):
+                if is_cache_ready[i] <= data_idx:
+                    if self.order_idx_by_cache[i] is None:
+                        self.data_order_with_cache.append([])
+                        self.data_cache_level.append(i)
+
+                        self.order_idx_by_cache[i] = len(self.data_order_with_cache) - 1
+
+                    self.data_order_with_cache[self.order_idx_by_cache[i]].append(data_idx)
+
+                    is_cache_ready[i] = self.next_data_idx[i].get(data_idx, data_idx + 1)
+                    if len(self.data_order_with_cache[self.order_idx_by_cache[i]]) == self.cache_batch_size[i]:
+                        self.order_idx_by_cache[i] = None
+                    for j in range(i + 1, self.total_prefix_num):
+                        self.order_idx_by_cache[j] = None
+        # print(self.data_order_with_cache[:40])
+        # print(self.data_cache_level, data_len)
+        # print(self.next_data_idx)
+
+    def __len__(self):
+        return len(self.data_cache_level)
+
+    def get_cache(self) -> Tuple[Optional[SequenceCache], int]:
         """Get cache for a list of sources. Return None if any source is not cached.
 
         Return:
             cache (`SequenceCache`): The (left padded) cache for the sources.
-            prefix_num (`int`): The number of prefixes that are matched in the cache.
+            cache_level (`int`): The number of prefixes that are matched in the cache.
         """
+        if self.data_idx is None:
+            raise RuntimeError("Cache can only be get during iteration.")
+
+        cache_level = self.data_cache_level[self.data_idx]
+        if cache_level == 0:
+            return None, 0
+
+        def lower_bound(i, l) -> Tuple[int, int]:
+            max_k = 0
+            for k, _ in self.next_data_idx[l].items():
+                if k < i:
+                    max_k = max(max_k, k)
+            return max_k, self.next_data_idx[l][max_k]
+
+        # logger.warning(
+        #     f"Get cache: {self.data_idx} {self.data_cache_level[self.data_idx]} {self.data_order_with_cache[self.data_idx]} "
+        # )
+
         caches = []
-        for src in sources:
-            results = list(self.cache_trie.prefix(src))
-            # check all sources have the same prefix number
+        last_cache_count = 1
+        last_cache_st = -1
+        last_cache_ed = 0
+        last_cache: Optional[SequenceCache] = None
+        for i in self.data_order_with_cache[self.data_idx]:
+            # get the `cache_level - 1` cache for the current data
+            if last_cache_ed <= i:
+                if last_cache is not None:
+                    # if i goes out of the range of the last cache, we pop the last cache
+                    caches.append(last_cache.expand_seq(last_cache_count))
+                    del self.cache[(cache_level - 1, last_cache_st)]
 
-            if len(results) > 0:
-                data = self.cache_data[int(results[-1][0])]
-                # logger.warning(f"G{trie_idx}")
-                caches.append(data)
-                cache_level = data.cache_level
+                last_cache_st = i
+                last_cache_ed = self.next_data_idx[cache_level - 1].get(i, None)
+                if last_cache_ed is None:
+                    last_cache_st, last_cache_ed = lower_bound(i, cache_level - 1)
+                last_cache_count = 1
+                last_cache = self.cache[(cache_level - 1, last_cache_st)]
             else:
-                return None, 0
+                last_cache_count += 1
+        caches.append(last_cache.expand_seq(last_cache_count))
 
-        # logger.warning(f"Get cache: {sources}, {cache_level}")
+        # logger.warning(f"{caches}")
+
         return SequenceCache.pad_and_stack(caches), cache_level
 
-    def set_cache(self, src: str, cache: SequenceCache, prefix_num: int):
+    def set_cache(self, caches: List[SequenceCache]):
         if self.data_idx is None:
             raise RuntimeError("Cache can only be set during iteration.")
 
-        cache.cache_level = prefix_num + 1
-        trie_idx = self.cache_trie.insert(src)
-        # logger.warning(f"S{trie_idx}")
-        if trie_idx > len(self.cache_data):
-            self.cache_data.extend([None] * (trie_idx - len(self.cache_data) + 1))
-            self.cache_data.append(cache)
-        elif trie_idx == len(self.cache_data):
-            self.cache_data.append(cache)
-        else:
-            self.cache_data[trie_idx] = cache
+        # logger.warning(
+        #     f"Set cache: {self.data_idx} {self.data_cache_level[self.data_idx]} {self.data_order_with_cache[self.data_idx]}"
+        # )
 
-        # logger.warning(f"Set cache: {src}, {prefix_num}")
-        self.queued_size[prefix_num] += self.postfix_nums_2[src]
-        self.cache_idx[prefix_num] += 1
-
-    def _get_cache_level(self, data_idx: int, max_cache_level: int) -> int:
-        cache_level = 0
-        source = self.joined_data[max_cache_level - 1][data_idx]
-        prefix_lengths = set(map(lambda x: x[1], self.cache_trie.prefix(source)))
-        for i in range(max_cache_level):
-            if len(self.joined_data[i][data_idx]) in prefix_lengths:
-                cache_level += 1
-        return cache_level
+        cache_level = self.data_cache_level[self.data_idx]
+        for i, cache in zip(self.data_order_with_cache[self.data_idx], caches):
+            self.cache[(cache_level, i)] = cache
 
     def fetch_to_cache(self, data_idx: int, yield_with_cache: bool) -> Tuple[List[int], bool]:
         to_cache = []
         with_cache = []
         last_prefix = None
         # we need one more level of cache
-        need_cache_num = min(self._get_cache_level(data_idx, self.total_prefix_num) + 1, self.total_prefix_num)
+        need_cache_num = min(self.cache_levels[data_idx] + 1, self.total_prefix_num)
 
         while len(to_cache) < self.cache_batch_size and data_idx < self.data_len:
             joined_prefix = self.joined_data[need_cache_num - 1][data_idx]
-            cur_cache_num = self._get_cache_level(data_idx, need_cache_num)
+            cur_cache_num = self.cache_levels[data_idx]
             # logger.warning(f">>> {data_idx} '{self.joined_data[need_cache_num - 1][data_idx]}'")
 
             if joined_prefix != last_prefix:
                 if yield_with_cache and cur_cache_num < self.total_prefix_num and len(with_cache) > 0:
                     # early stopping of with_cache
                     # logger.warning(f"Yield with cache 1: {with_cache}")
+                    for i in with_cache:
+                        self.cache_levels[i] += 1
                     return with_cache, True
                 elif cur_cache_num < self.total_prefix_num:
                     # we failed to find any prefix with available cache, so we need to cache first
@@ -270,17 +309,27 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                 # logger.warning(f"Add: {len(joined_prefix)}")
                 if len(with_cache) == self.batch_size:
                     # logger.warning(f"Yield with cache 2: {with_cache}")
+                    for i in with_cache:
+                        self.cache_levels[i] += 1
                     return with_cache, True
 
             data_idx += 1
             last_prefix = joined_prefix
         # logger.warning(f"Yield to cache??: {to_cache} {with_cache}")
         if yield_with_cache:
+            for i in with_cache:
+                self.cache_levels[i] += 1
             return with_cache, True
         else:
             return to_cache, False
 
     def __iter__(self) -> Iterator[List[int]]:
+        for self.data_idx in range(len(self.data_order_with_cache)):
+            # logger.warning(f"Data idx: {self.data_idx}, {self.data_order_with_cache[self.data_idx]}")
+            yield self.data_order_with_cache[self.data_idx]
+        self.data_idx = None
+
+    def __legacy_iter__(self) -> Iterator[List[int]]:
         self.data_idx = 0
         self.data_len = len(self.data)
 
@@ -316,4 +365,4 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         self.data_idx = None
 
     def __repr__(self) -> str:
-        return f"CachePrefixSampler(batch_size={self.batch_size}, cache_batch_size={self.cache_batch_size}, total_prefix_num={self.total_prefix_num})"
+        return f"CachePrefixSampler(cache_batch_size={self.cache_batch_size}, total_prefix_num={self.total_prefix_num})"

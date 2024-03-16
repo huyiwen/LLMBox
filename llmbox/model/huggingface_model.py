@@ -142,7 +142,8 @@ class HuggingFaceModel(Model):
         batched_inputs: List[str],
         prefix_cache: Optional[SequenceCache] = None,
         device: Optional[str] = None,
-        add_prefix: bool = False,
+        add_dummy_prefix: bool = False,
+        dummy_prefix: str = "text ",
         padding: bool = True,
     ) -> Union[List[List[int]], _PostfixEncoding]:
         """Tokenize the inputs as postfix. If `prefix_cache` is provided, the attention_mask of the prefix will be concatenated with the input attention_mask and the position_ids of the input will be calculated based on the length of the prefix.
@@ -167,10 +168,10 @@ class HuggingFaceModel(Model):
             _to["device"] = torch.device(device)
 
         # tokenize the postfix like a postfix. this is useful to handle tokenizers like llama
-        if prefix_cache is not None and prefix_cache.last_tokens is not None:
+        if prefix_cache is not None and len(prefix_cache.last_tokens) == batch_size:
             batched_inputs = [l + p for l, p in zip(prefix_cache.last_tokens, batched_inputs)]
-        elif add_prefix:
-            batched_inputs = ["text " + p for p in batched_inputs]
+        elif add_dummy_prefix:
+            batched_inputs = [dummy_prefix + p for p in batched_inputs]
 
         # use the same tokenizer, but different padding strategy
         batched_encodings = self.tokenizer(batched_inputs)
@@ -181,8 +182,8 @@ class HuggingFaceModel(Model):
                 slice(batched_encodings.char_to_token(i, len(l)), self.tokenizer.model_max_length)
                 for i, l in enumerate(prefix_cache.last_tokens)
             ]
-        elif add_prefix:
-            char_index = len("text ")
+        elif add_dummy_prefix:
+            char_index = len(dummy_prefix)
             ids_slice = [
                 slice(batched_encodings.char_to_token(i, char_index), self.tokenizer.model_max_length)
                 for i in range(batch_size)
@@ -309,23 +310,17 @@ class HuggingFaceModel(Model):
             # grouped_prefixes: a list of batched substrings without the last group (target text) with shape [GroupNum - 1, BatchSize]
             *grouped_prefixes, targets = list(map(list, zip(*batched_inputs)))
             cache_level = len(grouped_prefixes)
-            batch_size = len(grouped_prefixes[0])
 
             # if cache is available, get_ppl_with_cache
-            all_prefix = ["".join(seq_tuple[:-1]) for seq_tuple in batched_inputs]
-            prefix_cache, cached_num = self.cacher.get_cache(all_prefix)
+            prefix_cache, cached_num = self.cacher.get_cache()
             if prefix_cache is not None and cached_num == cache_level:
                 return self.get_ppl_with_cache(targets, prefix_cache, exact_match)
 
             # pass the input without prefix text to the model
-            concat_cached_prefix = [
-                "".join(pg[i] for pg in grouped_prefixes[:cached_num + 1]) for i in range(batch_size)
-            ]
             prefix_cache = self.get_cache(
-                grouped_prefixes[cached_num], prefix_cache, save_last_logits=cached_num == len(grouped_prefixes) - 1
+                grouped_prefixes[cached_num], prefix_cache, save_last_logits=cached_num == cache_level - 1
             )
-            for p, c in zip(concat_cached_prefix, prefix_cache):
-                self.cacher.set_cache(p, c, cached_num)
+            self.cacher.set_cache(prefix_cache)
             return []
 
         prompt = ["".join(seq_tuple) for seq_tuple in batched_inputs]
@@ -335,6 +330,7 @@ class HuggingFaceModel(Model):
             padding=True,
             truncation=True,
             return_attention_mask=True,
+            return_offsets_mapping=True,
             return_tensors="pt",
         ).to(device=self.device)
 
@@ -349,7 +345,13 @@ class HuggingFaceModel(Model):
                                   shift_labels.view(-1)).view(shift_labels.size(0), -1)
 
         src_lengths = [len("".join(pg[:-1])) for pg in batched_inputs]
-        tgt_starts = [batched_encodings.char_to_token(i, l) for i, l in enumerate(src_lengths)]
+        # tgt_starts = [batched_encodings.char_to_token(i, l) for i, l in enumerate(src_lengths)]
+        offsets = [list(map(lambda x: x[0], offset)) for offset in batched_encodings["offset_mapping"]]
+        tgt_starts = [
+            max(offset.index(src_len),
+                attention_mask.nonzero()[0][0].item() + 1) for src_len, offset, attention_mask in
+            zip(src_lengths, offsets, batched_encodings["attention_mask"])
+        ]
         ed = len(batched_encodings["input_ids"][0])
 
         if exact_match:
@@ -398,8 +400,7 @@ class HuggingFaceModel(Model):
                     else:
                         generation_kwargs["do_sample"] = False
                 elif key == "stop":
-                    self.stop_id_sequences = self._tokenize_postfix(value, add_prefix=True, padding=False)
-                    print(self.stop_id_sequences)
+                    self.stop_id_sequences = self._tokenize_postfix(value, add_dummy_prefix=True, padding=False)
                     generation_kwargs["stopping_criteria"] = [KeyWordsCriteria(self.stop_id_sequences)]
                 else:
                     generation_kwargs[key] = value
@@ -439,28 +440,22 @@ class HuggingFaceModel(Model):
         """
         if isinstance(batched_inputs[0], str):
             prompts = batched_inputs
-            batch_size = len(batched_inputs)
         else:
             grouped_prompts = list(map(list, zip(*batched_inputs)))
-            prompts = ["".join(pg[i] for pg in grouped_prompts) for i in range(batch_size)]
-            cache_level = len(grouped_prompts)
-            batch_size = len(grouped_prompts[0])
+            prompts = ["".join(pg[i] for pg in grouped_prompts) for i in range(len(grouped_prompts[0]))]
+            cache_level = len(grouped_prompts) - 1
 
         if use_cache and self.cacher is not None:
             # if cache is available, generation_with_cache
-            prefix_cache, cached_num = self.cacher.get_cache(prompts)
-            if prefix_cache is not None and cached_num == cache_level - 1:
+            prefix_cache, cached_num = self.cacher.get_cache()
+            if prefix_cache is not None and cached_num == cache_level:
                 return self.generation_with_cache(grouped_prompts[-1], prefix_cache)
 
             # pass the input without prefix text to the model
-            concat_cached_prefix = [
-                "".join(pg[i] for pg in grouped_prompts[:cached_num + 1]) for i in range(batch_size)
-            ]
             prefix_cache = self.get_cache(
-                grouped_prompts[cached_num], prefix_cache, save_last_logits=cached_num == len(grouped_prompts) - 1
+                grouped_prompts[cached_num], prefix_cache, save_last_logits=cached_num == cache_level - 1
             )
-            for p, c in zip(concat_cached_prefix, prefix_cache):
-                self.cacher.set_cache(p, c, cached_num)
+            self.cacher.set_cache(prefix_cache)
             return []
 
         batched_encodings = self.tokenizer(
@@ -549,21 +544,17 @@ class HuggingFaceModel(Model):
             # grouped_prompts: a list of batched substrings with shape [GroupNum, BatchSize]
             *grouped_prompts, batched_option_nums = map(list, zip(*batched_inputs))
             batched_prompts = ["".join(seq_tuple[:-1]) for seq_tuple in batched_inputs]
-            cache_level = len(grouped_prompts)
-            batch_num = len(grouped_prompts[0])
+            cache_level = len(grouped_prompts) - 1
 
         if self.cacher is not None and use_cache:
             # if cache is available, get_prob_with_cache
-            all_prefix = ["".join(seq_tuple[:-1]) for seq_tuple in batched_inputs]
-            prefix_cache, cached_num = self.cacher.get_cache(all_prefix)
-            if prefix_cache is not None and cached_num == cache_level - 1:
+            prefix_cache, cached_num = self.cacher.get_cache()
+            if prefix_cache is not None and cached_num == cache_level:
                 return self.get_prob_with_cache(grouped_prompts[-1], batched_option_nums, prefix_cache)
 
             # pass the input without prefix text to the model
-            concat_cached_prefix = ["".join(pg[i] for pg in grouped_prompts[:cached_num + 1]) for i in range(batch_num)]
             prefix_cache = self.get_cache(grouped_prompts[cached_num], prefix_cache, save_last_logits=False)
-            for p, c in zip(concat_cached_prefix, prefix_cache):
-                self.cacher.set_cache(p, c, cached_num)
+            self.cacher.set_cache(prefix_cache)
             return []
 
         batched_encodings = self.tokenizer(

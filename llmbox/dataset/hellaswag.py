@@ -33,7 +33,7 @@ class Hellaswag(MultipleChoiceDataset):
         text = text.replace(" [title]", ". ")
         text = re.sub("\\[.*?\\]", "", text)
         text = text.replace("  ", " ")
-        return text
+        return text.strip()
 
     def format_instance(self, instance):
         # https://github.com/EleutherAI/lm-evaluation-harness/blob/a3e56afeab01d1a847ecf37cfed35ffeec2c0150/lm_eval/tasks/hellaswag/utils.py#L15

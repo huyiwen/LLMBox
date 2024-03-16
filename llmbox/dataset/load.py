@@ -103,9 +103,10 @@ def load_dataset(args: "DatasetArguments", model: "Model", threading: bool = Tru
     if len(subset_names) > 1 and accepts_subset(dataset_cls.load_args, overwrite_subset=len(args.subset_names) > 0):
         # race:middle,high (several subsets) , super_glue (all the subsets)
         logger.info(f"Loading subsets of dataset `{args.dataset_name}`: " + ", ".join(subset_names))
-        first_dataset = subset_names.pop()
-        first_dataset = (first_dataset, dataset_cls(args, model, first_dataset))
         if threading and len(subset_names) >= 8:
+            # load first dataset first to avoid multiple times of logging message
+            first_dataset = subset_names.pop()
+            first_dataset = (first_dataset, dataset_cls(args, model, first_dataset))
             logging.disable(logging.INFO)
             with ThreadPoolExecutor(max_workers=len(subset_names)) as executor:
                 res = [executor.submit(lambda s: (s, dataset_cls(args, model, s)), s) for s in subset_names]
