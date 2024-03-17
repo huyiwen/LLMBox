@@ -103,6 +103,7 @@ class Evaluator:
                 dataloader = dynamic_stride_tqdm(total=self.dataset.len(option_num=False), **tqdm_kwargs)
 
         # call model
+        self.model.post_fork_init()
         raw_predictions = []
         for batch in dataloader:
             batch_results = call_model(batch)

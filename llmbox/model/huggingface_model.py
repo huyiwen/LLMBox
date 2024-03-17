@@ -458,8 +458,6 @@ class HuggingFaceModel(Model):
         Returns:
             List[str]: The list of generation results.
         """
-        if not hasattr(self, "_is_fork_init"):
-            self.post_fork_init()
 
         if isinstance(batched_inputs[0], str):
             prompts = batched_inputs
