@@ -58,6 +58,7 @@ class vllmModel(Model):
             model=args.model_name_or_path,
             tokenizer=args.tokenizer_name_or_path,
             tensor_parallel_size=torch.cuda.device_count(),
+            quantization="gptq" if args.gptq else None,
             **llm_kwargs,
         )
         self.tokenizer = self.model.get_tokenizer()

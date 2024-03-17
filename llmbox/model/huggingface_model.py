@@ -43,6 +43,8 @@ def load_hf_model(args: "ModelArguments") -> Tuple[PreTrainedModel, PreTrainedTo
     model_kwargs = dict(
         torch_dtype=torch.float16,
         device_map=args.device_map,
+        load_in_4bit=args.load_in_4bit,
+        load_in_8bit=args.load_in_8bit,
     )
 
     if args.prefix_caching:
@@ -50,6 +52,9 @@ def load_hf_model(args: "ModelArguments") -> Tuple[PreTrainedModel, PreTrainedTo
 
     if args.flash_attention:
         model_kwargs["attn_implementation"] = "flash_attention_2"
+
+    if hasattr(args, 'bnb_config') and args.bnb_config:
+        model_kwargs['quantization_config'] = args.bnb_config
 
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs).eval()
