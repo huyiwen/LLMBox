@@ -37,9 +37,11 @@ class Openai(Model):
         self.args = args
         self.name = args.model_name_or_path
         self.type = "instruction" if self.name in OPENAI_INSTRUCTION_MODELS else "base"
-        self.is_chat_model = self.name in OPENAI_CHAT_MODELS
         self.tokenizer = tiktoken.get_encoding(tiktoken.encoding_name_for_model(self.name))
         self.max_try_times = 5
+
+        self.is_chat_model = self.name in OPENAI_CHAT_MODELS
+        """OpenAI chat-based models only support `batch_size = 1`"""
 
     def set_ppl_args(self, **extra_model_args):
         r"""Set the configurations for PPL score calculation."""
@@ -140,7 +142,12 @@ class Openai(Model):
             answers.append(answer)
         return [tuple(answers)] if self.multi_turn else answers
 
-    def get_prob(self, batched_inputs: List[Tuple[str, int]]) -> List[List[int]]:
+    def get_prob(
+        self,
+        batched_inputs: List[Tuple[str, int]],
+        use_logit_bias: bool = True,
+        return_real_logprobs: bool = True
+    ) -> List[List[int]]:
 
         *batched_prompts, batched_option_nums = map(list, zip(*batched_inputs))
         batch_size = len(batched_prompts[0])
@@ -155,13 +162,17 @@ class Openai(Model):
             logit_bias = [dict.fromkeys(l, 100)[0] for l in labels]
 
         kwargs = copy(self.prob_kwargs)
-        if self.is_chat_model:
-            kwargs["logprobs"] = True
-            kwargs["top_logprobs"] = len(label_texts)
-        else:
-            kwargs["logprobs"] = len(label_texts)
+        if return_real_logprobs:
+            if self.is_chat_model:
+                kwargs["logprobs"] = True
+                kwargs["top_logprobs"] = len(label_texts)
+            else:
+                kwargs["logprobs"] = len(label_texts)
 
-        results = self.request(batched_prompts, self.prob_kwargs, logit_bias=logit_bias)
+        if use_logit_bias:
+            results = self.request(batched_prompts, self.prob_kwargs, logit_bias=logit_bias)
+        else:
+            results = self.request(batched_prompts, self.prob_kwargs)
 
         answers = []
         for result, option_num, label in zip(results, batched_option_nums, label_texts):
@@ -186,7 +197,8 @@ class Openai(Model):
                     text = result["message"]["content"]
                 else:
                     text = result["text"]
-                probs[label.index(text)] = 20.0
+                if text in label:
+                    probs[label.index(text)] = 20.0
 
             answers.append(probs)
         return answers
