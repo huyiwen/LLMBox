@@ -1,12 +1,13 @@
 from logging import getLogger
 
-from .generation_dataset import GenerationDataset
-from .enum import BBH_PROMPTS, BBH_NO_CHOICE, BBH_LETTER_CHOICE
 from ..metric import Em
+from .enum import BBH_LETTER_CHOICE, BBH_NO_CHOICE, BBH_PROMPTS
+from .generation_dataset import GenerationDataset
 
 logger = getLogger(__name__)
 
 import re
+
 
 class Bbh(GenerationDataset):
     """The dataset of BBH.
@@ -28,17 +29,14 @@ class Bbh(GenerationDataset):
     def __init__(self, args, model, subset_name: str):
         self.instruction = self.instruction.format(BBH_PROMPTS[subset_name])
         self.task = subset_name
-        self.extra_model_args = dict(stop=["\n"]) if args.cot is None else dict()
+        self.extra_model_args = dict(stop=["\n", "Q:", "\n\n", "</s>"])
         super().__init__(args, model, subset_name)
 
     def format_instance(self, instance):
         target = instance["answer"]
         if target is None or self.args.cot is None:
             target = instance["label"]
-        return dict(
-            source="Q: " + instance["input"].strip() + "\nA:",
-            target=" " + target
-        )
+        return dict(source="Q: " + instance["input"].strip() + "\nA:", target=" " + target)
 
     def post_processing(self, predictions):
         new_predictions = []

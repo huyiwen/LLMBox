@@ -67,7 +67,6 @@ class Evaluator:
             num_workers=10,
             prefetch_factor=2,
         )
-        self.model.post_fork_init()
 
         if self.evaluation_args.dry_run:
             self.model.get_ppl = lambda x: [(0, 1)] * len(x)

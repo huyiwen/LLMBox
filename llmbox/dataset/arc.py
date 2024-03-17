@@ -31,7 +31,7 @@ class Arc(MultipleChoiceDataset):
     evaluation_set = "validation"
     example_set = "train"
     load_args = ("allenai/ai2_arc",)
-    normalization_prompt = "Question:\nAnswer:"
+    normalization_prompt = "Question: \nAnswer:"
 
     def format_instance(self, instance):
         options = list(map(lambda _s: " " + _s.lstrip(), instance["choices"]["text"]))

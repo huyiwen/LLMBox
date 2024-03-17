@@ -161,6 +161,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         data: Sequence[Tuple[str, ...]],
         batch_size: int,
     ):
+        print("!!")
         self.data = data
         self.data_idx = 0
 
@@ -289,6 +290,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         self.data_idx += 1
 
     def __iter__(self) -> Iterator[List[int]]:
+        print("!")
         self.data_idx = 0
         yield from self.data_order_with_cache
 

@@ -108,18 +108,19 @@ class HuggingFaceModel(Model):
                 " model type, which can be chosen from `base` and `instruction`."
             )
 
-        self.model, self.tokenizer = load_hf_model(args)
+        self.model, self.slow_tokenizer = load_hf_model(args)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     def post_fork_init(self):
         self.tokenizer = load_tokenizer(
-            self.args.tokenizer_name_or_path, use_fast=True, max_length=self.tokenizer.model_max_length
+            self.args.tokenizer_name_or_path, use_fast=True, max_length=self.slow_tokenizer.model_max_length
         )
         if hasattr(self, "generation_kwargs") and "stop" in self.generation_kwargs:
             self.stop_id_sequences = self._tokenize_postfix(
                 self.generation_kwargs.pop("stop"), add_dummy_prefix=True, padding=False
             )
             self.generation_kwargs["stopping_criteria"] = [KeyWordsCriteria(self.stop_id_sequences)]
+        self._is_fork_init = True
 
     def _process_postfix_encodings(
         self,
@@ -424,8 +425,8 @@ class HuggingFaceModel(Model):
                 else:
                     generation_kwargs[key] = value
 
-        generation_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
-        generation_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+        generation_kwargs["pad_token_id"] = self.slow_tokenizer.pad_token_id
+        generation_kwargs["eos_token_id"] = self.slow_tokenizer.eos_token_id
         self.generation_kwargs = generation_kwargs
 
         self._generation_args_set = True
@@ -457,6 +458,9 @@ class HuggingFaceModel(Model):
         Returns:
             List[str]: The list of generation results.
         """
+        if not hasattr(self, "_is_fork_init"):
+            self.post_fork_init()
+
         if isinstance(batched_inputs[0], str):
             prompts = batched_inputs
         else:

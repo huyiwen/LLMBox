@@ -9,13 +9,13 @@ from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data.sampler import BatchSampler, SequentialSampler
 
 from ..model.huggingface_model import HuggingFaceModel
 from ..model.vllm_model import vllmModel
 from ..utils import dynamic_stride_tqdm
 from ..utils.cache_prefix_sampler import CachePrefixSampler
-from .icl_strategies import (ape, global_entropy_ordering_strategy,
-                             knn_construct_examples)
+from .icl_strategies import (ape, global_entropy_ordering_strategy, knn_construct_examples)
 from .utils import get_raw_dataset_loader
 
 if typing.TYPE_CHECKING:
@@ -112,10 +112,10 @@ class Dataset(torch.utils.data.Dataset):
         self.name = args.dataset_name
         self.subset_name = subset_name
         self.model = model
-        self.tokenizer = model.tokenizer
+        self.tokenizer = model.slow_tokenizer
 
         self._post_init_arguments()
-        
+
         self.num_shots = args.num_shots
         self.max_example_tokens = args.max_example_tokens
         self.examples = ""
@@ -762,7 +762,9 @@ class Dataset(torch.utils.data.Dataset):
                     batch_size=self.args.batch_size,
                 )
             else:
-                self._batch_sampler = None
+                self._batch_sampler = BatchSampler(
+                    SequentialSampler(self), batch_size=self.args.batch_size, drop_last=False
+                )
         return self._batch_sampler
 
     def last_score_lists(self) -> Dict[str, List[float]]:
@@ -878,7 +880,9 @@ class DatasetCollection(torch.utils.data.Dataset):
                     batch_size=self.args.batch_size,
                 )
             else:
-                self._batch_sampler = None
+                self._batch_sampler = BatchSampler(
+                    SequentialSampler(self), batch_size=self.args.batch_size, drop_last=False
+                )
         return self._batch_sampler
 
     def log_predictions(
