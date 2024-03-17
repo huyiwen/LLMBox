@@ -37,6 +37,9 @@ class Model:
     def __init__(self, args: "ModelArguments"):
         self.args = args
 
+    def post_fork_init(self):
+        return
+
     def set_cacher(self, cacher: "Cacher"):
         r"""Set the cacher for this model. The cacher is used to cache the generated results for the model."""
         self.cacher = cacher

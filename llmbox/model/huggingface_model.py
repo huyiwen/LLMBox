@@ -18,13 +18,26 @@ if TYPE_CHECKING:
 
 logger = getLogger(__name__)
 
-_Tokenizer = Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
 _InputsWithOptionNum = Union[List[Tuple[str, int]], List[Tuple[str, str, int]], List[Tuple[str, str, str, int]]]
 _PostfixEncoding = Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], List[int], List[int]]
 """`tuple(input_ids, attention_mask, input_pos, prefix_lengths, input_lengths)`"""
 
 
-def load_hf_model(args: "ModelArguments") -> Tuple[PreTrainedModel, _Tokenizer]:
+def load_tokenizer(tokenizer_name_or_path: str, use_fast: bool, max_length: int):
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name_or_path, use_fast=use_fast, padding_side="left", truncation_side="left", add_eos_token=False
+    )
+
+    # TODO: [Important]!!! check for each tokenizer
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.unk_token
+
+    max_length = min(max_length, getattr(tokenizer, "tokenizer_model_max_length", 1e10))
+    tokenizer.model_max_length = max_length
+    return tokenizer
+
+
+def load_hf_model(args: "ModelArguments") -> Tuple[PreTrainedModel, PreTrainedTokenizer]:
     logger.info(f"Loading {args.model_name_or_path} using Hugging Face Transformers...")
 
     model_kwargs = dict(
@@ -51,16 +64,8 @@ def load_hf_model(args: "ModelArguments") -> Tuple[PreTrainedModel, _Tokenizer]:
         else:
             raise e
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer_name_or_path, use_fast=True, padding_side="left", truncation_side="left", add_eos_token=False
-    )
-
     # TODO: [Important]!!! check for each tokenizer
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.unk_token
-
-    # TODO: [Important]!!! check for each tokenizer
-    max_length = min(getattr(tokenizer, "tokenizer_model_max_length", 1e10), getattr(args, "max_length") or 1e10)
+    max_length = args.max_length or 1e10
     for key in [
         "max_sequence_length",
         "max_position_embeddings",
@@ -78,9 +83,9 @@ def load_hf_model(args: "ModelArguments") -> Tuple[PreTrainedModel, _Tokenizer]:
             f"Cannot specify model's maximum length according to `args` or model config. Set to 2048 by default."
         )
 
-    tokenizer.model_max_length = max_length
-    logger.debug(f"Model: {model}\nTokenizer: {tokenizer}")
-    return model, tokenizer
+    slow_tokenizer = load_tokenizer(args.tokenizer_name_or_path, use_fast=False, max_length=max_length)
+    logger.debug(f"Model: {model}\nTokenizer: {slow_tokenizer}")
+    return model, slow_tokenizer
 
 
 class HuggingFaceModel(Model):
@@ -100,6 +105,16 @@ class HuggingFaceModel(Model):
 
         self.model, self.tokenizer = load_hf_model(args)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def post_fork_init(self):
+        self.tokenizer = load_tokenizer(
+            self.args.tokenizer_name_or_path, use_fast=True, max_length=self.tokenizer.model_max_length
+        )
+        if hasattr(self, "generation_kwargs") and "stop" in self.generation_kwargs:
+            self.stop_id_sequences = self._tokenize_postfix(
+                self.generation_kwargs.pop("stop"), add_dummy_prefix=True, padding=False
+            )
+            self.generation_kwargs["stopping_criteria"] = [KeyWordsCriteria(self.stop_id_sequences)]
 
     def _process_postfix_encodings(
         self,
@@ -314,6 +329,7 @@ class HuggingFaceModel(Model):
             # if cache is available, get_ppl_with_cache
             prefix_cache, cached_num = self.cacher.get_cache()
             if prefix_cache is not None and cached_num == cache_level:
+                self.cacher.step()
                 return self.get_ppl_with_cache(targets, prefix_cache, exact_match)
 
             # pass the input without prefix text to the model
@@ -321,6 +337,7 @@ class HuggingFaceModel(Model):
                 grouped_prefixes[cached_num], prefix_cache, save_last_logits=cached_num == cache_level - 1
             )
             self.cacher.set_cache(prefix_cache)
+            self.cacher.step()
             return []
 
         prompt = ["".join(seq_tuple) for seq_tuple in batched_inputs]
@@ -349,8 +366,8 @@ class HuggingFaceModel(Model):
         offsets = [list(map(lambda x: x[0], offset)) for offset in batched_encodings["offset_mapping"]]
         tgt_starts = [
             max(offset.index(src_len),
-                attention_mask.nonzero()[0][0].item() + 1) for src_len, offset, attention_mask in
-            zip(src_lengths, offsets, batched_encodings["attention_mask"])
+                attention_mask.nonzero()[0][0].item() + 1)
+            for src_len, offset, attention_mask in zip(src_lengths, offsets, batched_encodings["attention_mask"])
         ]
         ed = len(batched_encodings["input_ids"][0])
 
@@ -399,9 +416,6 @@ class HuggingFaceModel(Model):
                         generation_kwargs["do_sample"] = True
                     else:
                         generation_kwargs["do_sample"] = False
-                elif key == "stop":
-                    self.stop_id_sequences = self._tokenize_postfix(value, add_dummy_prefix=True, padding=False)
-                    generation_kwargs["stopping_criteria"] = [KeyWordsCriteria(self.stop_id_sequences)]
                 else:
                     generation_kwargs[key] = value
 
@@ -449,6 +463,7 @@ class HuggingFaceModel(Model):
             # if cache is available, generation_with_cache
             prefix_cache, cached_num = self.cacher.get_cache()
             if prefix_cache is not None and cached_num == cache_level:
+                self.cacher.step()
                 return self.generation_with_cache(grouped_prompts[-1], prefix_cache)
 
             # pass the input without prefix text to the model
@@ -456,6 +471,7 @@ class HuggingFaceModel(Model):
                 grouped_prompts[cached_num], prefix_cache, save_last_logits=cached_num == cache_level - 1
             )
             self.cacher.set_cache(prefix_cache)
+            self.cacher.step()
             return []
 
         batched_encodings = self.tokenizer(
@@ -550,11 +566,13 @@ class HuggingFaceModel(Model):
             # if cache is available, get_prob_with_cache
             prefix_cache, cached_num = self.cacher.get_cache()
             if prefix_cache is not None and cached_num == cache_level:
+                self.cacher.step()
                 return self.get_prob_with_cache(grouped_prompts[-1], batched_option_nums, prefix_cache)
 
             # pass the input without prefix text to the model
             prefix_cache = self.get_cache(grouped_prompts[cached_num], prefix_cache, save_last_logits=False)
             self.cacher.set_cache(prefix_cache)
+            self.cacher.step()
             return []
 
         batched_encodings = self.tokenizer(

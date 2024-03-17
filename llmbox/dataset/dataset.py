@@ -14,7 +14,8 @@ from ..model.huggingface_model import HuggingFaceModel
 from ..model.vllm_model import vllmModel
 from ..utils import dynamic_stride_tqdm
 from ..utils.cache_prefix_sampler import CachePrefixSampler
-from .icl_strategies import (ape, global_entropy_ordering_strategy, knn_construct_examples)
+from .icl_strategies import (ape, global_entropy_ordering_strategy,
+                             knn_construct_examples)
 from .utils import get_raw_dataset_loader
 
 if typing.TYPE_CHECKING:
@@ -95,6 +96,7 @@ class Dataset(torch.utils.data.Dataset):
         "example_set",
         "load_args",
         "extra_model_args",
+        "use_normalization",
     ]
 
     def __init__(self, args: "DatasetArguments", model: "Model", subset_name: Optional[str] = None):
@@ -334,16 +336,22 @@ class Dataset(torch.utils.data.Dataset):
         self.option_nums = []
         if self.model_evaluation_method == "get_ppl":
             for formatted_instance in self.formatted_evaluation_data:
-                instance_with_examples = self.format_instruction_and_examples(
-                    formatted_instance, split_prefix=self.model.args.prefix_caching
-                )
+                instance_with_examples = self.format_instruction_and_examples(formatted_instance)
                 if "options" in formatted_instance:
-                    if self.model.args.prefix_caching:
+                    if isinstance(instance_with_examples, list):
                         options = [(*instance_with_examples, option) for option in formatted_instance["options"]]
+                        prefix_length = len(instance_with_examples)
                     else:
                         options = [(instance_with_examples, option) for option in formatted_instance["options"]]
-                    self.evaluation_instances.extend(options)
+                        prefix_length = 1
+
                     self.option_nums.append(len(options))
+
+                    if self.use_normalization:
+                        options = self._apply_normalization(options, prefix_length - 1)
+
+                    self.evaluation_instances.extend(options)
+
                 else:
                     # multiple contexts instead of options, cases like winogrande
                     contexts = [(context, formatted_instance["target"]) for context in instance_with_examples]
@@ -354,16 +362,12 @@ class Dataset(torch.utils.data.Dataset):
             logger.info("Formatted example (source)\n" + pformat(self.evaluation_instances[0][:-1]))
             logger.info(f"Formatted example (option)\n" + pformat(self.evaluation_instances[0][-1]))
             if len(self.evaluation_instances) > 1:
-                logger.debug("Next formatted example (source)\n" + pformat(self.evaluation_instances[1][0:-1]))
+                logger.debug("Next formatted example (source)\n" + pformat(self.evaluation_instances[1][:-1]))
                 logger.debug("Next formatted example (option)\n" + pformat(self.evaluation_instances[1][-1]))
 
         elif self.model_evaluation_method == "generation":
             for formatted_instance in self.formatted_evaluation_data:
-                self.evaluation_instances.append(
-                    self.format_instruction_and_examples(
-                        formatted_instance, split_prefix=self.model.args.prefix_caching
-                    )
-                )
+                self.evaluation_instances.append(self.format_instruction_and_examples(formatted_instance))
 
             logger.info("Evaluation mode: generation based on the source text")
             logger.info("Formatted example (source)\n" + pformat(self.evaluation_instances[0]))
@@ -372,9 +376,7 @@ class Dataset(torch.utils.data.Dataset):
 
         elif self.model_evaluation_method == "get_prob":
             for formatted_instance in self.formatted_evaluation_data:
-                instance_with_examples = self.format_instruction_and_examples(
-                    formatted_instance, split_prefix=self.model.args.prefix_caching
-                )
+                instance_with_examples = self.format_instruction_and_examples(formatted_instance)
                 option_num = len(formatted_instance["options"])
                 self.option_nums.append(option_num)
                 if isinstance(instance_with_examples, str):
@@ -383,9 +385,9 @@ class Dataset(torch.utils.data.Dataset):
                     self.evaluation_instances.append(tuple(instance_with_examples) + (option_num,))
 
             logger.info("Evaluation mode: get the probability of each option label")
-            logger.info("Formatted example (source)\n" + pformat(self.evaluation_instances[0][0]))
+            logger.info("Formatted example (source)\n" + pformat(self.evaluation_instances[0][:-1]))
             if len(self.evaluation_instances) > 1:
-                logger.debug("Next formatted example (source)\n" + pformat(self.evaluation_instances[1][0]))
+                logger.debug("Next formatted example (source)\n" + pformat(self.evaluation_instances[1][:-1]))
             logger.debug(f"option_nums: {self.option_nums}")
 
         else:
@@ -458,7 +460,7 @@ class Dataset(torch.utils.data.Dataset):
         """
         raise NotImplementedError(f"{self.name} dataset must implement the `format_instance` function.")
 
-    def format_instruction_and_examples(self, instance, split_prefix: bool = False) -> Union[str, List[str]]:
+    def format_instruction_and_examples(self, instance, split_prefix: Optional[bool] = None) -> Union[str, List[str]]:
         r"""Format one instance with the instruction and demonstration.
 
         Args:
@@ -467,6 +469,9 @@ class Dataset(torch.utils.data.Dataset):
         Returns:
             Union[str, List[str]]: The final formatted instance. Return a list of formatted instances if the source is a list (in cases like winogrande).
         """
+        if split_prefix is None:
+            split_prefix = self.model.args.prefix_caching
+
         if self.examples == "" or self.kate or self.globale:
             self.examples = self.construct_examples(instance)
 
@@ -605,6 +610,7 @@ class Dataset(torch.utils.data.Dataset):
             processed_predictions (Optional[List[Union[str, float]]]): The processed answers.
             file (Optional[str]): The file path to save the predictions. If None, will use `args.evaluation_results_path`.
         """
+        return
 
         file = file or self.args.evaluation_results_path
         if processed_predictions is not None:
@@ -768,6 +774,12 @@ class Dataset(torch.utils.data.Dataset):
     def use_normalization(self) -> bool:
         return self.name in {"arc", "openbookqa", "race"}
 
+    def _apply_normalization(self, options: List[Tuple[str, ...]], prefix_length: int) -> List[Tuple[str, ...]]:
+        normalized_option = ("",) * prefix_length + (self.normalization_prompt,)
+        normalized_options = [normalized_option + (option,) for *_, option in options]
+        options = [o for g in zip(options, normalized_options) for o in g]
+        return options
+
     def len(self, sample_num: bool = True, option_num: bool = True, normalization: bool = True) -> int:
         """Provides a unified interface to retrieve the length of dataset`.
 
@@ -875,6 +887,7 @@ class DatasetCollection(torch.utils.data.Dataset):
         score_lists: Optional[Dict[str, List[float]]] = None,
         file: Optional[str] = None
     ):
+        return
         lines = []
         raw = self._split_by_subset(raw_predictions, strict=processed_predictions is not None)
         processed = self._split_by_subset(processed_predictions, option_num=False, normalization=False)

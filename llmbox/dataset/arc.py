@@ -1,4 +1,5 @@
 from logging import getLogger
+from pprint import pformat
 from typing import List, Tuple, Union
 
 import numpy as np
@@ -27,37 +28,23 @@ class Arc(MultipleChoiceDataset):
         """
 
     instruction = ""
-    evaluation_set = "test"
+    evaluation_set = "validation"
     example_set = "train"
     load_args = ("allenai/ai2_arc",)
+    normalization_prompt = "Question:\nAnswer:"
 
     def format_instance(self, instance):
-        options = list(map(lambda _s: " " + _s, instance["choices"]["text"]))
+        options = list(map(lambda _s: " " + _s.lstrip(), instance["choices"]["text"]))
         if instance["answerKey"].isdigit():
             instance["answerKey"] = ord(instance["answerKey"]) - 49
         else:
             instance["answerKey"] = ord(instance["answerKey"]) - 65
         return dict(
-            source="Question: " + instance["question"],
+            source="Question: " + instance["question"].strip(),
             source_postfix="\nAnswer:",
             target_idx=instance["answerKey"],
             options=options,
         )
-
-    def construct_instances(self):
-        self.evaluation_instances = []
-        self.option_nums = []
-        for formatted_instance in self.formatted_evaluation_data:
-            instance_with_examples = self.format_instruction_and_examples(formatted_instance)
-            options = [(instance_with_examples, option) for option in formatted_instance['options']]
-            self.option_nums.append(len(options))
-            answer_options = [("Answer:", option) for option in formatted_instance["options"]]
-            options = [item for pair in zip(options, answer_options) for item in pair]
-            self.evaluation_instances.extend(options)
-        logger.info("Evaluation mode: calculate PPL of the optional text based on the source text")
-        logger.info("Formatted example (source)\n" + self.evaluation_instances[0][0])
-        logger.info("Formatted example (option)\n" + self.evaluation_instances[0][1])
-        self.evaluation_instances = self.evaluation_instances * self.args.sample_num
 
     def post_processing(self, predictions: List[Tuple[float, int]]) -> List[int]:
         labels = []

@@ -131,7 +131,7 @@ def load_dataset(args: "DatasetArguments", model: "Model", threading: bool = Tru
         # in some cases, get_dataset_config_names() returns one subset, where you should not pass the subset name, i.e. `len(available_subsets) != 1`
         # copa (super_glue:copa) or mmlu
         logger.info(f"Loading dataset `{args.dataset_name}`")
-        return dataset_cls(args, model)
+        return dataset_cls(args, model, None)
 
 
 def load_datasets(args: "DatasetArguments",

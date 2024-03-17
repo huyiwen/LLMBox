@@ -21,7 +21,7 @@ class Siqa(MultipleChoiceDataset):
     load_args = ("lighteval/siqa",)
 
     def format_instance(self, instance):
-        source = instance["context"] + "\nQuestion: " + instance["question"]
+        source = "Q: " + instance["context"] + " " + instance["question"]
 
         label2text = {
             "1": " " + instance["answerA"],
@@ -32,7 +32,7 @@ class Siqa(MultipleChoiceDataset):
         options = [label2text[option] for option in ["1", "2", "3"]]
         return dict(
             source=source,
-            source_postfix="\nAnswer:",
+            source_postfix="\nA:",
             target_idx=int(instance["label"]) - 1,
             options=options,
         )
