@@ -170,14 +170,20 @@ class Openai(Model):
                 kwargs["logprobs"] = len(label_texts)
 
         if use_logit_bias:
-            results = self.request(batched_prompts, self.prob_kwargs, logit_bias=logit_bias)
+            if self.is_chat_model:
+                results = [self.request(p, kwargs, logit_bias=lb)[0] for p, lb in zip(batched_prompts, logit_bias)]
+            else:
+                results = self.request(batched_prompts, self.prob_kwargs, logit_bias=logit_bias)
         else:
-            results = self.request(batched_prompts, self.prob_kwargs)
+            if self.is_chat_model:
+                results = [self.request(p, kwargs)[0] for p in batched_prompts]
+            else:
+                results = self.request(batched_prompts, self.prob_kwargs)
 
         answers = []
         for result, option_num, label in zip(results, batched_option_nums, label_texts):
             result = result[0] if self.is_chat_model else result
-            if result["logprobs"] is not None:
+            if result.get("logprobs", None) is not None:
 
                 probs = [-9999.] * (option_num * 2)
                 if self.is_chat_model:
@@ -194,9 +200,9 @@ class Openai(Model):
             else:
                 probs = [-9999.] * (option_num * 2)
                 if self.is_chat_model:
-                    text = result["message"]["content"]
+                    text = result["message"]["content"].strip()[-1:]
                 else:
-                    text = result["text"]
+                    text = result["text"].strip()[-1:]
                 if text in label:
                     probs[label.index(text)] = 20.0
 

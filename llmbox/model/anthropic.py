@@ -100,7 +100,7 @@ class Anthropic(Model):
         answers = []
         for result, option_num, label in zip(results, batched_option_nums, label_texts):
             probs = [-9999.] * (option_num * 2)
-            text = result[0].content[0].text
+            text = result[0].content[0].text.strip()[-1:]
             if text in label:
                 probs[label.index(text)] = 20.0
             answers.append(probs)

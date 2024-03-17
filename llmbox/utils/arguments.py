@@ -362,9 +362,9 @@ def check_args(model_args: ModelArguments, dataset_args: DatasetArguments, evalu
     """
     model_args.seed = evaluation_args.seed
     if model_args.model_name_or_path.lower() in OPENAI_CHAT_MODELS and dataset_args.batch_size > 1:
-        dataset_args.batch_size = 1
+        # dataset_args.batch_size = 1
         logger.warning(
-            f"OpenAI chat-based model {model_args.model_name_or_path} doesn't support batch_size > 1, automatically set batch_size to 1."
+            f"OpenAI chat-based model {model_args.model_name_or_path} doesn't support batch_size > 1 natively."
         )
     if model_args.model_name_or_path.lower() in ANTHROPIC_MODELS and dataset_args.batch_size > 1:
         dataset_args.batch_size = 1
