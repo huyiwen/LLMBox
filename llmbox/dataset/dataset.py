@@ -184,11 +184,9 @@ class Dataset(torch.utils.data.Dataset):
             self.args.ranking_with_options = False
 
         # batch sampler
-        if self.model.args.prefix_caching and (
-            self.model_evaluation_method not in {"get_ppl", "get_prob"} or not isinstance(self.model, HuggingFaceModel)
-        ):
+        if self.model.args.prefix_caching and not isinstance(self.model, HuggingFaceModel):
             logger.warning(
-                "Prefix caching is only available for get_ppl or get_prob method of HuggingFaceModel. Automatically set prefix_caching to False"
+                "Prefix caching is only available for HuggingFaceModel. Automatically set prefix_caching to False"
             )
             self.model.args.prefix_caching = False
 
@@ -496,8 +494,11 @@ class Dataset(torch.utils.data.Dataset):
             source = self.args.instance_format.format(source=instance["source"], target="")
             results = [instruction, self.examples, source]
             if split_prefix:  # to support prefix_caching
-                return [p for p in results if len(p) > 0]
+                results = [p for p in results if len(p) > 0]
+                self.total_prefix_num = len(results)
+                return results
             else:
+                self.total_prefix_num = 1
                 return "".join(results)
 
     def construct_examples(self, instance: Optional[dict] = None) -> str:
@@ -756,7 +757,7 @@ class Dataset(torch.utils.data.Dataset):
 
     def get_batch_sampler(self, disable: bool = False) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
-            if not disable and self.model.args.prefix_caching and isinstance(self.model, HuggingFaceModel):
+            if not disable and self.model.args.prefix_caching and getattr(self, "total_prefix_num", 1) > 1:
                 self._batch_sampler = CachePrefixSampler(
                     data=self,
                     batch_size=self.args.batch_size,
@@ -874,7 +875,7 @@ class DatasetCollection(torch.utils.data.Dataset):
 
     def get_batch_sampler(self, disable: bool = False) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
-            if not disable and self._datasets[0].model.args.prefix_caching and isinstance(self.model, HuggingFaceModel):
+            if not disable and self._datasets[0].model.args.prefix_caching and getattr(self, "total_prefix_num", 1) > 1:
                 self._batch_sampler = CachePrefixSampler(
                     data=self,
                     batch_size=self.args.batch_size,

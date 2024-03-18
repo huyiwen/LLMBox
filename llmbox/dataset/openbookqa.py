@@ -26,7 +26,7 @@ class OpenBookQA(MultipleChoiceDataset):
     evaluation_set = "test"
     example_set = "train"
     load_args = ("openbookqa", "main")
-    normalization_prompt = "Q:\nA:"
+    normalization_prompt = "Q: \nA:"
 
     def format_instance(self, instance):
         source_text = "Q: " + instance['question_stem']

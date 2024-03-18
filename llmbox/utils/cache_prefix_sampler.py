@@ -213,8 +213,8 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                         self.order_idx_by_cache[i] = None
 
         print(self.data_order_with_cache[:40])
-        print(self.data_cache_level, data_len)
-        # print(self.next_data_idx)
+        print(self.data_cache_level, data_len, self.total_prefix_num)
+        print(self.next_data_idx)
 
     def __len__(self):
         return len(self.data_cache_level)
@@ -238,9 +238,9 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                     max_k = max(max_k, k)
             return max_k, self.next_data_idx[l].get(max_k, max_k + 1)
 
-        logger.warning(
-            f"Get cache: {self.data_idx} {self.data_cache_level[self.data_idx]} {self.data_order_with_cache[self.data_idx]} "
-        )
+        # logger.warning(
+        #     f"Get cache: {self.data_idx} {self.data_cache_level[self.data_idx]} {self.data_order_with_cache[self.data_idx]} "
+        # )
 
         caches = []
         last_cache_count = 1
@@ -253,7 +253,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                 if last_cache is not None:
                     # if i goes out of the range of the last cache, we pop the last cache
                     caches.append(last_cache.expand_seq(last_cache_count))
-                    print("del", cache_level - 1, last_cache_st)
+                    # print("del", cache_level - 1, last_cache_st)
                     del self.cache[(cache_level - 1, last_cache_st)]
 
                 last_cache_st = i
@@ -264,7 +264,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                     else:
                         last_cache_st, last_cache_ed = lower_bound(i, cache_level - 1)
                 last_cache_count = 1
-                print(i, cache_level - 1, last_cache_st, last_cache_ed, last_cache_count)
+                # print(i, cache_level - 1, last_cache_st, last_cache_ed, last_cache_count)
                 last_cache = self.cache[(cache_level - 1, last_cache_st)]
             else:
                 last_cache_count += 1
@@ -276,9 +276,9 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
 
     def set_cache(self, caches: List[SequenceCache]):
 
-        logger.warning(
-            f"Set cache: {self.data_idx} {self.data_cache_level[self.data_idx]} {self.data_order_with_cache[self.data_idx]}"
-        )
+        # logger.warning(
+        #     f"Set cache: {self.data_idx} {self.data_cache_level[self.data_idx]} {self.data_order_with_cache[self.data_idx]}"
+        # )
 
         cache_level = self.data_cache_level[self.data_idx]
         for i, cache in zip(self.data_order_with_cache[self.data_idx], caches):
@@ -286,7 +286,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
             # logger.warning(f"Set cache: {cache_level} {i}")
 
     def step(self):
-        print("step", self.data_idx)
+        # print("step", self.data_idx)
         self.data_idx += 1
 
     def __iter__(self) -> Iterator[List[int]]:

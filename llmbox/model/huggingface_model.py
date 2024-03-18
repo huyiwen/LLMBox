@@ -122,19 +122,19 @@ class HuggingFaceModel(Model):
             self.generation_kwargs["stopping_criteria"] = [KeyWordsCriteria(self.stop_id_sequences)]
         self._is_fork_init = True
 
-    def _process_postfix_encodings(
+    def _get_prefix_mask(
         self,
-        attention_mask: torch.Tensor,
         prefix_cache: SequenceCache,
+        max_input_len: Optional[int] = None,
         device: Optional[str] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
-        """Concatenate the attention_mask of the prefix with the input attention_mask and calculate the position_ids of the input based on the length of the prefix."""
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[int]]:
 
         _to = dict(dtype=torch.long, device=self.device)
         if device is not None:
             _to["device"] = torch.device(device)
+
         max_prefix_len = prefix_cache.get_seq_length()
-        batch_size, max_input_len = attention_mask.size()
+        batch_size = prefix_cache.get_seq_num()
 
         # prepare attention_mask of prefix, and position_ids of postfix (continue from the last token of prefix)
         prefix_mask = torch.ones((batch_size, max_prefix_len), **_to)
@@ -142,7 +142,8 @@ class HuggingFaceModel(Model):
             # same prefix for all inputs
             prefix_cache = prefix_cache.expand_seq(batch_size)
             prefix_lengths = [prefix_cache.get_seq_length()] * batch_size
-            input_pos = torch.arange(max_prefix_len, max_prefix_len + max_input_len, **_to).expand(batch_size, -1)
+            if max_input_len is not None:
+                input_pos = torch.arange(max_prefix_len, max_prefix_len + max_input_len, **_to).expand(batch_size, -1)
         else:
             # different prefix for each input
             prefix_lengths = []
@@ -151,12 +152,14 @@ class HuggingFaceModel(Model):
                 prefix_len = prefix_cache.real_seq_length[seq_idx]
                 prefix_mask[seq_idx, :-prefix_len] = 0  # prefix is left padded
                 prefix_lengths.append(prefix_len)
-                input_pos.append(torch.arange(prefix_len, max_input_len + prefix_len))
-            input_pos = torch.stack(input_pos).to(**_to)
-
-        # concatenate the prefix and input attention_mask
-        attention_mask = torch.cat([prefix_mask, attention_mask], dim=1).to(**_to)  # type: ignore
-        return attention_mask, input_pos, prefix_lengths
+                if max_input_len is not None:
+                    input_pos.append(torch.arange(prefix_len, prefix_len + max_input_len))
+            if max_input_len is not None:
+                input_pos = torch.stack(input_pos).to(**_to)
+        if max_input_len is not None:
+            return prefix_mask, input_pos, prefix_lengths
+        else:
+            return prefix_mask, None, prefix_lengths
 
     def _tokenize_postfix(
         self,
@@ -225,7 +228,10 @@ class HuggingFaceModel(Model):
             attention_mask[i, :len(ids)] = 1
 
         if prefix_cache is not None:
-            attention_mask, input_pos, prefix_lengths = self._process_postfix_encodings(attention_mask, prefix_cache)
+            prefix_mask, input_pos, prefix_lengths = self._get_prefix_mask(prefix_cache, max_input_len, device=device)
+
+            # concatenate the prefix and input attention_mask
+            attention_mask = torch.cat([prefix_mask, attention_mask], dim=1).to(**_to)  # type: ignore
         else:
             prefix_lengths = [0] * batch_size
             input_pos = None
@@ -411,6 +417,7 @@ class HuggingFaceModel(Model):
 
             if key == "max_tokens" and value is None:
                 value = 1024
+
             if value is not None:
                 if key == "max_tokens":
                     generation_kwargs["max_new_tokens"] = value
@@ -439,20 +446,22 @@ class HuggingFaceModel(Model):
         prefix_cache: SequenceCache,
     ) -> List[str]:
 
-        batched_encodings = self.tokenizer(
-            batched_inputs,
-            padding=True,
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors="pt",
-        ).to(self.device)
+        caches = self.get_cache(batched_inputs, prefix_cache)
+        prefix_cache = SequenceCache.pad_and_stack(caches)
 
-        batch_outputs = self.model.generate(**batched_encodings, **self.generation_kwargs)
-        self.generation_kwargs["stopping_criteria"][0].step()
+        attention_mask, _, _ = self._get_prefix_mask(prefix_cache)
 
-        self._process_generation_results()
+        batch_outputs = self.model.generate(
+            attention_mask=attention_mask, past_key_values=prefix_cache.to_legacy_cache(), **self.generation_kwargs
+        )
+        for criteria in self.generation_kwargs.get("stopping_criteria", []):
+            if isinstance(criteria, KeyWordsCriteria):
+                criteria.step()
 
-    def generation(self, batched_inputs: Union[List[str], List[Tuple[str, ...]]], use_cache: bool = False) -> List[str]:
+        answers = self._process_generation_results(batch_outputs)
+        return answers
+
+    def generation(self, batched_inputs: Union[List[str], List[Tuple[str, ...]]], use_cache: bool = True) -> List[str]:
         """Generate the response of given question for this batch.
 
         Returns:
@@ -471,6 +480,7 @@ class HuggingFaceModel(Model):
             prefix_cache, cached_num = self.cacher.get_cache()
             if prefix_cache is not None and cached_num == cache_level:
                 self.cacher.step()
+                # print("cached_num1", cached_num, "cache_level", cache_level, "prefix_cache", prefix_cache)
                 return self.generation_with_cache(grouped_prompts[-1], prefix_cache)
 
             # pass the input without prefix text to the model
@@ -479,6 +489,7 @@ class HuggingFaceModel(Model):
             )
             self.cacher.set_cache(prefix_cache)
             self.cacher.step()
+            # print("cached_num2", cached_num, "cache_level", cache_level, "prefix_cache", prefix_cache)
             return []
 
         batched_encodings = self.tokenizer(
@@ -491,7 +502,9 @@ class HuggingFaceModel(Model):
         max_input_length = batched_encodings["input_ids"].size(1)
 
         batch_outputs = self.model.generate(**batched_encodings, **self.generation_kwargs)
-        self.generation_kwargs["stopping_criteria"][0].step()
+        for criteria in self.generation_kwargs.get("stopping_criteria", []):
+            if isinstance(criteria, KeyWordsCriteria):
+                criteria.step()
 
         batch_outputs = batch_outputs[:, max_input_length:]
         answers = self._process_generation_results(batch_outputs)
