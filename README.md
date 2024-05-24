@@ -21,7 +21,7 @@ Training
 Utilization
 
 - **Comprehensive Evaluation:** 56+ commonly used datasets and benchmarks in evaluating LLMs.
-- **Evaluation Methods:** Accurately reproduce results from original papers of OpenAI, LLaMA, Mistral, and other models.
+- **Evaluation Methods:** Reproduce aligned results from original papers of OpenAI, LLaMA, Mistral, and other models.
 - **In-Context Learning:** We support various ICL strategies, including [`KATE`](https://aclanthology.org/2022.deelio-1.10/), [`GlobalE`](https://aclanthology.org/2022.acl-long.556/), and [`APE`](https://arxiv.org/abs/2211.01910).
 - **Chain-of-Thought:** For some datasets, we support three types of CoT evaluation: `base`, [`least-to-most`](https://arxiv.org/abs/2205.10625), and [`pal`](https://arxiv.org/abs/2211.10435).
 - **Prefix Caching:** By managing the KV Cache of prefixes, we can speed up local inference by up to 6x.
